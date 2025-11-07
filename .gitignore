@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+.ipynb_checkpoints/
+.DS_Store
+*.slurm
+*.err
+*.out
+*.log
