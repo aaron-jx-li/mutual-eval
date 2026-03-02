@@ -53,7 +53,9 @@ OPENAI_MODELS = {
 
 math_openai_dataset = [
     row for row in math_dataset
-    if row["model_a"] in OPENAI_MODELS and row["model_b"] in OPENAI_MODELS
+    if row["model_a"] in OPENAI_MODELS
+    and row["model_b"] in OPENAI_MODELS
+    and row.get("language") == "en"
 ]
 
 math_openai_output_path = "data/arena_140k_math_openai.json"
@@ -66,3 +68,19 @@ with open(math_openai_output_path, "w") as f:
     f.write("\n]")
 
 print(f"Saved {len(math_openai_dataset)} math+openai records to {math_openai_output_path}")
+
+math_openai_single_dataset = [
+    row for row in math_openai_dataset
+    if row.get("evaluation_order") == 1
+]
+
+math_openai_single_output_path = "data/arena_140k_math_openai_single.json"
+with open(math_openai_single_output_path, "w") as f:
+    f.write("[\n")
+    for i, row in enumerate(tqdm(math_openai_single_dataset, desc="Saving math+openai+single", total=len(math_openai_single_dataset))):
+        f.write(json.dumps(row))
+        if i < len(math_openai_single_dataset) - 1:
+            f.write(",\n")
+    f.write("\n]")
+
+print(f"Saved {len(math_openai_single_dataset)} math+openai+single records to {math_openai_single_output_path}")
