@@ -11,3 +11,5 @@ __pycache__/
 *.out
 *.log
 *.jsonl
+data/arena_140k.json
+data/arena_140k_math.json
