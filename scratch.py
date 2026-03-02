@@ -41,7 +41,7 @@ with open(input_path, "r") as f:
     math_dataset = json.load(f)
 
 OPENAI_MODELS = {
-    "chatgpt-4o-latest-20250326",
+    # "chatgpt-4o-latest-20250326",
     "gpt-4o-2024-11-20",
     "gpt-4o-mini-2024-07-18",
     "gpt-4.1-2025-04-14",

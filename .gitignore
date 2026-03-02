@@ -13,3 +13,4 @@ __pycache__/
 *.jsonl
 data/arena_140k.json
 data/arena_140k_math.json
+results/*
