@@ -1,0 +1,7 @@
+# Core — needed for generating predictions
+anthropic>=0.56.0
+datasets>=4.0.0
+python-dotenv>=1.0.0
+
+# Evaluation harness — needs Docker Desktop running locally
+swebench>=4.1.0

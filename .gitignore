@@ -14,3 +14,5 @@ __pycache__/
 data/arena_140k.json
 data/arena_140k_math.json
 results/*
+rm_test.py
+reward_client.py
