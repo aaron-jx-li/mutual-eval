@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""
+Static math evaluation pipeline for the current 16-model roster.
+
+Key design choices:
+1. Use the model roster from `model_api_smoke_test.py` so the eval stays aligned.
+2. Sample static benchmarks rather than running full benchmarks by default.
+3. Use a flexible LLM judge for correctness on every example.
+
+Usage examples:
+    python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl
+    python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl --models gpt-5.4 claude-opus-4-6
+    python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl --judge-model gpt-4.1-mini
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+import re
+import sys
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from statistics import mean
+from typing import Any
+
+import anthropic
+from datasets import load_dataset
+from openai import BadRequestError, OpenAI
+from tqdm import tqdm
+import yaml
+
+from model_api_smoke_test import (
+    MODEL_LOOKUP,
+    MODEL_SPECS,
+    extract_chat_content,
+    get_env_value,
+    load_env_file,
+    normalize_base_url,
+)
+
+
+ANSWER_INSTRUCTION = (
+    "Solve the math problem carefully. "
+    "End your response with a final line of the form 'Final answer: <answer>'."
+)
+
+JUDGE_SYSTEM_INSTRUCTIONS = (
+    "You are a careful mathematics grader. "
+    "Determine whether a model response is mathematically correct. "
+    "Mark an answer correct when the final answer is mathematically equivalent to the ground truth, "
+    "even if it uses a different but equivalent form. "
+    "Treat equivalent forms as correct, including fractions vs decimals (for example 11/2 and 5.5), "
+    "unsimplified vs simplified expressions, equivalent algebraic forms, and equivalent interval/set notation "
+    "when they represent the same solution. "
+    "For multiple-choice questions, accept either the correct option letter or the correct option content. "
+    "Do not reward style, verbosity, or formatting. Focus on mathematical correctness."
+)
+
+JUDGE_PROMPT_TEMPLATE = """\
+Question:
+{question}
+
+Ground-truth answer:
+{gold_answer}
+
+Model response:
+{model_answer}
+
+Decide whether the model response is mathematically correct.
+
+Important grading rules:
+- Count mathematically equivalent answers as correct.
+- Examples of equivalent answers include 11/2 and 5.5, 0.5 and 1/2, or algebraically equivalent expressions.
+- For multiple-choice questions, accept either the correct letter choice or the correct option content.
+- Minor notation differences or harmless formatting differences should not make a correct answer wrong.
+- If the response contains reasoning plus a final answer, judge based on whether the final mathematical conclusion is correct and supported well enough.
+
+Return ONLY a JSON object:
+{{"correct": true or false, "reason": "brief explanation"}}
+"""
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    name: str
+    hf_path: str
+    hf_config: str | None
+    split: str
+    kind: str
+    default_pilot_samples: int
+    default_paper_samples: int
+
+
+DATASET_SPECS: list[DatasetSpec] = [
+    DatasetSpec("gsm8k", "openai/gsm8k", "main", "test", "gsm8k", 30, 50),
+    DatasetSpec(
+        "mmlu-abstract",
+        "brucewlee1/mmlu-abstract-algebra",
+        None,
+        "test",
+        "mmlu",
+        10,
+        20,
+    ),
+    DatasetSpec(
+        "mmlu-college",
+        "brucewlee1/mmlu-college-mathematics",
+        None,
+        "test",
+        "mmlu",
+        10,
+        20,
+    ),
+    DatasetSpec("math-algebra", "EleutherAI/hendrycks_math", "algebra", "test", "math", 10, 35),
+    DatasetSpec(
+        "math-counting",
+        "EleutherAI/hendrycks_math",
+        "counting_and_probability",
+        "test",
+        "math",
+        10,
+        50,
+    ),
+    DatasetSpec("math-geometry", "EleutherAI/hendrycks_math", "geometry", "test", "math", 10, 50),
+    DatasetSpec("math-number", "EleutherAI/hendrycks_math", "number_theory", "test", "math", 10, 50),
+    DatasetSpec(
+        "math-intermediate",
+        "EleutherAI/hendrycks_math",
+        "intermediate_algebra",
+        "test",
+        "math",
+        10,
+        55,
+    ),
+    DatasetSpec(
+        "math-prealgebra",
+        "EleutherAI/hendrycks_math",
+        "prealgebra",
+        "test",
+        "math",
+        10,
+        15,
+    ),
+    DatasetSpec(
+        "math-precalculus",
+        "EleutherAI/hendrycks_math",
+        "precalculus",
+        "test",
+        "math",
+        10,
+        15,
+    ),
+    DatasetSpec("aime-2025", "test-time-compute/aime_2025", None, "test", "aime", 5, 30),
+    DatasetSpec("aime-2026", "MathArena/aime_2026", None, "train", "aime", 5, 30),
+    DatasetSpec("olympiad-math", "math-ai/olympiadbench", None, "test", "olympiad", 10, 80),
+]
+
+DATASET_LOOKUP = {spec.name: spec for spec in DATASET_SPECS}
+
+
+def call_openai_compatible(
+    client: OpenAI,
+    model_id: str,
+    *,
+    user_prompt: str,
+    system_prompt: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int | None = 2048,
+) -> str:
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    request_kwargs: dict[str, Any] = {
+        "model": model_id,
+        "messages": messages,
+    }
+    if not model_id.startswith("gpt-5"):
+        request_kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        if model_id.startswith("gpt-5"):
+            request_kwargs["max_completion_tokens"] = max_tokens
+        else:
+            request_kwargs["max_tokens"] = max_tokens
+
+    try:
+        resp = client.chat.completions.create(**request_kwargs)
+    except BadRequestError as exc:
+        message = str(exc).lower()
+        if (
+            "max_tokens" in request_kwargs
+            and "unsupported" in message
+            and "max_tokens" in message
+        ):
+            retry_kwargs = dict(request_kwargs)
+            retry_kwargs.pop("max_tokens", None)
+            retry_kwargs["max_completion_tokens"] = max_tokens
+            resp = client.chat.completions.create(**retry_kwargs)
+        elif (
+            "max_completion_tokens" in request_kwargs
+            and "unsupported" in message
+            and "max_completion_tokens" in message
+        ):
+            retry_kwargs = dict(request_kwargs)
+            retry_kwargs.pop("max_completion_tokens", None)
+            retry_kwargs["max_tokens"] = max_tokens
+            resp = client.chat.completions.create(**retry_kwargs)
+        elif (
+            "temperature" in request_kwargs
+            and "unsupported" in message
+            and "temperature" in message
+        ):
+            retry_kwargs = dict(request_kwargs)
+            retry_kwargs.pop("temperature", None)
+            resp = client.chat.completions.create(**retry_kwargs)
+        else:
+            raise
+
+    return extract_chat_content(resp.choices[0].message.content)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate the current 16-model roster on static math benchmarks.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional YAML config file. Evaluation settings are read from the 'evaluation' section.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        choices=[spec.label for spec in MODEL_SPECS],
+        help="Models to evaluate. Defaults to all models in model_api_smoke_test.py.",
+    )
+    parser.add_argument(
+        "--sample-file",
+        default=None,
+        help="Path to a previously generated sampled_items.jsonl file.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="OpenAI judge model used for correctness grading.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for results. Defaults to results/static_eval/<timestamp>.",
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=50,
+        help="Periodically save partial responses and summary every N evaluations (default: 50).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing partial results in the output directory.",
+    )
+    return parser.parse_args()
+
+
+def build_output_dir(user_output_dir: str | None) -> Path:
+    if user_output_dir:
+        return Path(user_output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("results") / "static_eval" / timestamp
+
+
+def resolve_env_path() -> Path:
+    here = Path(__file__).resolve()
+    local_env = here.with_name(".env")
+    if local_env.exists():
+        return local_env
+    return here.parent.parent / ".env"
+
+
+def _expand_env(value: Any) -> Any:
+    if isinstance(value, str):
+        return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), m.group(0)), value)
+    if isinstance(value, dict):
+        return {k: _expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(v) for v in value]
+    return value
+
+
+def load_yaml_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    raw = yaml.safe_load(Path(path).read_text()) or {}
+    return _expand_env(raw)
+
+
+def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    config = load_yaml_config(args.config)
+    section = config.get("evaluation", {})
+
+    if args.models is None:
+        args.models = section.get("models", [spec.label for spec in MODEL_SPECS])
+    if args.sample_file is None:
+        args.sample_file = section.get("sample_file")
+        if args.sample_file is None:
+            sampling_output_dir = config.get("sampling", {}).get("output_dir")
+            if sampling_output_dir:
+                args.sample_file = str(Path(sampling_output_dir) / "sampled_items.jsonl")
+    if args.judge_model is None:
+        args.judge_model = section.get("judge_model", "gpt-4.1-mini")
+    if args.output_dir is None:
+        args.output_dir = section.get("output_dir")
+    if args.save_every == 50:
+        args.save_every = int(section.get("save_every", 50))
+    if not args.resume:
+        args.resume = bool(section.get("resume", False))
+
+    if not args.sample_file:
+        raise SystemExit("Error: --sample-file is required, either via CLI or config file.")
+    return args
+
+
+def build_sample_plan(selected_datasets: list[str], profile: str, uniform_n: int | None) -> dict[str, int]:
+    plan: dict[str, int] = {}
+    for name in selected_datasets:
+        spec = DATASET_LOOKUP[name]
+        if uniform_n is not None:
+            plan[name] = uniform_n
+        elif profile == "paper":
+            plan[name] = spec.default_paper_samples
+        else:
+            plan[name] = spec.default_pilot_samples
+    return plan
+
+
+def build_clients(selected_models: list[str]) -> dict[str, Any]:
+    clients: dict[str, Any] = {}
+    providers = {MODEL_LOOKUP[name].provider for name in selected_models}
+
+    if "openai" in providers or True:
+        key = get_env_value("OPENAI_API_KEY")
+        if key:
+            base_url = normalize_base_url(get_env_value("OPENAI_BASE_URL"), "openai")
+            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+
+    if "anthropic" in providers:
+        key = get_env_value("ANTHROPIC_API_KEY")
+        if key:
+            base_url = normalize_base_url(get_env_value("ANTHROPIC_BASE_URL"), "anthropic")
+            clients["anthropic"] = anthropic.Anthropic(api_key=key, base_url=base_url, timeout=120)
+
+    if "google" in providers:
+        key = get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
+        if key:
+            base_url = normalize_base_url(get_env_value("GEMINI_BASE_URL"), "google")
+            if base_url:
+                clients["google"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+
+    if "openrouter" in providers:
+        key = get_env_value("OPENROUTER_API_KEY")
+        if key:
+            clients["openrouter"] = OpenAI(
+                api_key=key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=120,
+            )
+
+    if "openai" not in clients:
+        sys.exit("OPENAI_API_KEY is required for the judge model.")
+    return clients
+
+
+def load_raw_rows(spec: DatasetSpec) -> list[dict]:
+    if spec.hf_config is None:
+        dataset = load_dataset(spec.hf_path)[spec.split]
+    else:
+        dataset = load_dataset(spec.hf_path, spec.hf_config)[spec.split]
+
+    rows = [dict(row) for row in dataset]
+    if spec.kind == "olympiad":
+        rows = [
+            row
+            for row in rows
+            if row.get("subject") == "Math"
+            and row.get("language") == "English"
+            and row.get("modality") == "Text-only"
+            and not row.get("is_multiple_answer", False)
+        ]
+    return rows
+
+
+def sample_rows(rows: list[dict], *, n: int, seed: int, stratify_field: str | None = None) -> list[dict]:
+    rng = random.Random(seed)
+    if n >= len(rows):
+        return list(rows)
+    if not stratify_field:
+        return rng.sample(rows, n)
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(stratify_field, "unknown"))].append(row)
+
+    buckets = list(grouped.values())
+    if not buckets:
+        return rng.sample(rows, n)
+
+    per_bucket = max(1, n // len(buckets))
+    sampled: list[dict] = []
+    leftovers: list[dict] = []
+    for bucket in buckets:
+        shuffled = list(bucket)
+        rng.shuffle(shuffled)
+        take = min(per_bucket, len(shuffled))
+        sampled.extend(shuffled[:take])
+        leftovers.extend(shuffled[take:])
+
+    if len(sampled) < n:
+        rng.shuffle(leftovers)
+        sampled.extend(leftovers[: n - len(sampled)])
+    elif len(sampled) > n:
+        rng.shuffle(sampled)
+        sampled = sampled[:n]
+    return sampled
+
+
+def format_mmlu_question(item: dict) -> str:
+    letters = ["A", "B", "C", "D", "E", "F"]
+    options = item.get("options", [])
+    option_lines = [f"({letters[idx]}) {option}" for idx, option in enumerate(options)]
+    return f"{item['centerpiece']}\n\nOptions:\n" + "\n".join(option_lines)
+
+
+def build_eval_prompt(dataset_spec: DatasetSpec, item: dict) -> str:
+    return f"{build_raw_question(dataset_spec, item)}\n\n{ANSWER_INSTRUCTION}"
+
+
+def build_raw_question(dataset_spec: DatasetSpec, item: dict) -> str:
+    if dataset_spec.kind == "gsm8k":
+        return item["question"]
+    if dataset_spec.kind == "mmlu":
+        return format_mmlu_question(item)
+    if dataset_spec.kind == "aime":
+        return item.get("question") or item.get("problem")
+    if dataset_spec.kind == "olympiad":
+        return item["question"]
+    return item["problem"]
+
+
+def build_gold_answer(dataset_spec: DatasetSpec, item: dict) -> str:
+    if dataset_spec.kind == "gsm8k":
+        return item["answer"]
+    if dataset_spec.kind == "mmlu":
+        letter = item["correct_options"][0]
+        literal = item["correct_options_literal"][0]
+        return f"Option {letter}: {literal}"
+    if dataset_spec.kind == "aime":
+        return str(item["answer"])
+    if dataset_spec.kind == "olympiad":
+        final_answer = item.get("final_answer")
+        if isinstance(final_answer, list):
+            return " ; ".join(str(part) for part in final_answer)
+        return str(final_answer)
+    return item["solution"]
+
+
+def get_item_metadata(dataset_spec: DatasetSpec, item: dict) -> dict[str, Any]:
+    if dataset_spec.kind == "gsm8k":
+        return {"level": None, "subject": "word_problems"}
+    if dataset_spec.kind == "mmlu":
+        return {"level": None, "subject": dataset_spec.name}
+    if dataset_spec.kind == "aime":
+        metadata = item.get("metadata") or {}
+        problem_type = metadata.get("problem_type")
+        if isinstance(problem_type, list) and problem_type:
+            subject = problem_type[0]
+        else:
+            subject = "AIME"
+        return {"level": "Competition", "subject": subject}
+    if dataset_spec.kind == "olympiad":
+        return {
+            "level": item.get("difficulty", "Competition"),
+            "subject": item.get("subfield") or item.get("subject") or "Olympiad",
+        }
+    return {"level": item.get("level"), "subject": item.get("type")}
+
+
+def judge_correctness(
+    judge_client: OpenAI,
+    judge_model: str,
+    *,
+    question: str,
+    gold_answer: str,
+    model_answer: str,
+) -> dict[str, Any]:
+    prompt = JUDGE_PROMPT_TEMPLATE.format(
+        question=question,
+        gold_answer=gold_answer,
+        model_answer=model_answer,
+    )
+    resp = judge_client.responses.create(
+        model=judge_model,
+        instructions=JUDGE_SYSTEM_INSTRUCTIONS,
+        input=prompt,
+        max_output_tokens=512,
+        store=False,
+    )
+    raw_text = resp.output_text.strip()
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        correct = bool(parsed.get("correct", False))
+        reason = str(parsed.get("reason", ""))
+    except json.JSONDecodeError:
+        lower = cleaned.lower()
+        correct = '"correct": true' in lower or '"correct":true' in lower
+        reason = cleaned[:500]
+    return {
+        "correct": correct,
+        "method": "llm_judge",
+        "judge_raw": raw_text,
+        "judge_reason": reason,
+    }
+
+
+def call_model(spec, clients: dict[str, Any], prompt: str) -> str:
+    if spec.provider == "openai":
+        return call_openai_compatible(
+            clients["openai"],
+            spec.model_id,
+            user_prompt=prompt,
+            temperature=0.0,
+            max_tokens=2048,
+        )
+    if spec.provider == "google":
+        return call_openai_compatible(
+            clients["google"],
+            spec.model_id,
+            user_prompt=prompt,
+            temperature=0.0,
+            max_tokens=2048,
+        )
+    if spec.provider == "openrouter":
+        return call_openai_compatible(
+            clients["openrouter"],
+            spec.model_id,
+            user_prompt=prompt,
+            temperature=0.0,
+            max_tokens=2048,
+        )
+    if spec.provider == "anthropic":
+        resp = clients["anthropic"].messages.create(
+            model=spec.model_id,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(
+            block.text for block in resp.content if getattr(block, "type", "") == "text"
+        ).strip()
+    raise ValueError(f"Unsupported provider: {spec.provider}")
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def make_eval_key(item_or_record: dict[str, Any], model_label: str | None = None) -> str:
+    label = model_label if model_label is not None else str(item_or_record["model_label"])
+    return f"{item_or_record['dataset']}::{item_or_record['sample_index']}::{label}"
+
+
+def write_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "model_label",
+                "dataset",
+                "num_items",
+                "num_scored",
+                "num_correct",
+                "accuracy",
+                "judge_graded",
+                "generation_errors",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+
+def save_checkpoint(
+    *,
+    output_dir: Path,
+    results: list[dict[str, Any]],
+    completed_evals: int,
+    total_evals: int,
+) -> None:
+    write_jsonl(output_dir / "responses.jsonl", results)
+    summary_rows = summarize_results(results)
+    write_summary_csv(output_dir / "summary.csv", summary_rows)
+    checkpoint = {
+        "completed_evals": completed_evals,
+        "total_evals": total_evals,
+        "saved_at": datetime.now().isoformat(),
+    }
+    (output_dir / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+
+
+def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["model_label"], row["dataset"])].append(row)
+
+    summary_rows: list[dict[str, Any]] = []
+    for (model_label, dataset_name), group in sorted(grouped.items()):
+        scored = [row for row in group if row["correct"] is not None]
+        all_binary = [int(bool(row["correct"])) for row in scored]
+        judge_count = sum(1 for row in group if row["grading_method"] == "llm_judge")
+        error_count = sum(1 for row in group if row["status"] != "ok")
+        summary_rows.append(
+            {
+                "model_label": model_label,
+                "dataset": dataset_name,
+                "num_items": len(group),
+                "num_scored": len(scored),
+                "num_correct": sum(all_binary),
+                "accuracy": mean(all_binary) if all_binary else None,
+                "judge_graded": judge_count,
+                "generation_errors": error_count,
+            }
+        )
+    return summary_rows
+
+
+def print_summary(summary_rows: list[dict[str, Any]]) -> None:
+    print("\nAccuracy summary")
+    print("-" * 80)
+    for row in summary_rows:
+        accuracy = row["accuracy"]
+        accuracy_text = f"{accuracy:.2%}" if accuracy is not None else "N/A"
+        print(
+            f"{row['model_label']:24} {row['dataset']:18} "
+            f"acc={accuracy_text:>8} "
+            f"scored={row['num_scored']:4}/{row['num_items']:4} "
+            f"judge={row['judge_graded']:4} errors={row['generation_errors']:3}"
+        )
+    print("-" * 80)
+
+
+def main() -> None:
+    args = parse_args()
+    load_env_file(resolve_env_path())
+    args = apply_config_defaults(args)
+
+    output_dir = build_output_dir(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_model_specs = [MODEL_LOOKUP[label] for label in args.models]
+    clients = build_clients(args.models)
+    sample_file = Path(args.sample_file)
+    sampled_items = load_jsonl(sample_file)
+    dataset_counts: dict[str, int] = defaultdict(int)
+    for item in sampled_items:
+        dataset_counts[str(item["dataset"])] += 1
+
+    run_config = {
+        "models": args.models,
+        "sample_file": str(sample_file),
+        "datasets": sorted(dataset_counts.keys()),
+        "sample_plan": dict(dataset_counts),
+        "judge_model": args.judge_model,
+        "output_dir": str(output_dir),
+        "resume": args.resume,
+    }
+    (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+
+    responses_path = output_dir / "responses.jsonl"
+    results: list[dict[str, Any]] = load_jsonl(responses_path) if args.resume else []
+    completed_keys = {make_eval_key(record) for record in results}
+    total_evals = len(sampled_items) * len(selected_model_specs)
+    completed_evals = len(completed_keys)
+    progress = tqdm(
+        total=total_evals,
+        initial=completed_evals,
+        desc="Evaluating static math",
+        unit="eval",
+    )
+
+    for item in sampled_items:
+        for model_spec in selected_model_specs:
+            eval_key = make_eval_key(item, model_spec.label)
+            if eval_key in completed_keys:
+                continue
+
+            progress.set_postfix_str(
+                f"{model_spec.label} | {item['dataset']} #{item['sample_index'] + 1}/{dataset_counts[item['dataset']]}",
+                refresh=False,
+            )
+
+            record: dict[str, Any] = {
+                "dataset": item["dataset"],
+                "dataset_kind": item["dataset_kind"],
+                "sample_index": item["sample_index"],
+                "model_label": model_spec.label,
+                "model_provider": model_spec.provider,
+                "model_id": model_spec.model_id,
+                "level": item["level"],
+                "subject": item["subject"],
+                "question": item["question"],
+                "prompt": item["prompt"],
+                "gold_answer": item["gold_answer"],
+                "status": "ok",
+                "correct": None,
+                "grading_method": "llm_judge",
+                "response_text": None,
+                "judge_reason": None,
+                "judge_raw": None,
+                "latency_s": None,
+            }
+
+            started = time.time()
+            try:
+                response_text = call_model(model_spec, clients, item["prompt"])
+                record["response_text"] = response_text
+                record["latency_s"] = round(time.time() - started, 2)
+            except Exception as exc:
+                record["status"] = "generation_error"
+                record["latency_s"] = round(time.time() - started, 2)
+                record["judge_reason"] = str(exc)
+                results.append(record)
+                completed_keys.add(eval_key)
+                progress.update(1)
+                completed_evals += 1
+                if args.save_every > 0 and completed_evals % args.save_every == 0:
+                    save_checkpoint(
+                        output_dir=output_dir,
+                        results=results,
+                        completed_evals=completed_evals,
+                        total_evals=total_evals,
+                    )
+                continue
+
+            judged = judge_correctness(
+                clients["openai"],
+                args.judge_model,
+                question=item["question"],
+                gold_answer=item["gold_answer"],
+                model_answer=record["response_text"] or "",
+            )
+            record["correct"] = judged["correct"]
+            record["grading_method"] = judged["method"]
+            record["judge_reason"] = judged["judge_reason"]
+            record["judge_raw"] = judged["judge_raw"]
+
+            results.append(record)
+            completed_keys.add(eval_key)
+            progress.update(1)
+            completed_evals += 1
+            if args.save_every > 0 and completed_evals % args.save_every == 0:
+                save_checkpoint(
+                    output_dir=output_dir,
+                    results=results,
+                    completed_evals=completed_evals,
+                    total_evals=total_evals,
+                )
+
+    progress.close()
+    summary_rows = summarize_results(results)
+    save_checkpoint(
+        output_dir=output_dir,
+        results=results,
+        completed_evals=completed_evals,
+        total_evals=total_evals,
+    )
+
+    print_summary(summary_rows)
+    print(f"\nSaved results to {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

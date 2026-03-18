@@ -1,0 +1,53 @@
+{
+  "models": [
+    "gpt-5.4",
+    "gpt-5-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    "gemini-3.1-pro",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "grok-4",
+    "deepseek-v3.2",
+    "mistral-large-3",
+    "qwen3-max-thinking",
+    "llama-4-maverick-instruct"
+  ],
+  "sample_file": "results/static_eval/math_v0/sampled_items.jsonl",
+  "datasets": [
+    "aime-2025",
+    "aime-2026",
+    "gsm8k",
+    "math-algebra",
+    "math-counting",
+    "math-geometry",
+    "math-intermediate",
+    "math-number",
+    "math-prealgebra",
+    "math-precalculus",
+    "mmlu-abstract",
+    "mmlu-college",
+    "olympiad-math"
+  ],
+  "sample_plan": {
+    "gsm8k": 50,
+    "mmlu-abstract": 20,
+    "mmlu-college": 20,
+    "math-algebra": 35,
+    "math-counting": 50,
+    "math-geometry": 50,
+    "math-number": 50,
+    "math-intermediate": 55,
+    "math-prealgebra": 15,
+    "math-precalculus": 15,
+    "aime-2025": 30,
+    "aime-2026": 30,
+    "olympiad-math": 80
+  },
+  "judge_model": "gpt-4.1-mini",
+  "output_dir": "results/static_eval/math_v0",
+  "resume": true
+}
