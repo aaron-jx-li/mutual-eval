@@ -19,8 +19,10 @@ sampling:
 evaluation:
   sample_file: results/static_eval/coding_v0/sampled_items.jsonl
   output_dir: results/static_eval/coding_v0
-  save_every: 50
+  save_every: 100
   resume: true
+  max_workers: 8
+  use_litellm: true
   models:
     - gpt-5.4
     - gpt-5-mini

@@ -26,11 +26,8 @@ import yaml
 from eval_static_coding import (
     DATASET_LOOKUP,
     DATASET_SPECS,
-    build_eval_prompt,
-    build_gold_answer,
-    build_raw_question,
     build_sample_plan,
-    get_item_metadata,
+    build_eval_prompt,
     load_env_file,
     load_raw_rows,
     sample_rows,
@@ -158,16 +155,11 @@ def main() -> None:
         )
 
         for idx, item in enumerate(sampled_rows):
-            metadata = get_item_metadata(spec, item)
             sampled_items.append(
                 {
                     "dataset": dataset_name,
-                    "dataset_kind": spec.kind,
                     "sample_index": idx,
-                    "question": build_raw_question(spec, item),
                     "prompt": build_eval_prompt(spec, item),
-                    "gold_answer": build_gold_answer(spec, item),
-                    **metadata,
                     "raw_item": item,
                 }
             )
