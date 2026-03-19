@@ -1,0 +1,33 @@
+# Arena math generation + reward evaluation config
+#
+# Workflow:
+#   python eval_static/eval_arena_math.py --config eval_static/config_arena.yaml
+
+evaluation:
+  input_file: data/arena_math_900.json
+  output_dir: results/arena_eval/arena_math_v0
+  use_litellm: true
+  save_every: 50
+  resume: true
+  max_workers: 4
+  generation_timeout: 120
+  reward_timeout: 300
+  reward_max_concurrency: 8
+  rm_base_url: ${ARENA_RM_BASE_URL}
+  rm_token: ${ARENA_RM_TOKEN}
+  models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct

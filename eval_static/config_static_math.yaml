@@ -1,0 +1,51 @@
+# Static math evaluation config
+#
+# Workflow:
+# 1. Sample a fixed item set:
+#    python eval_static/sample_static_math.py --config eval_static/config.yaml
+#
+# 2. Evaluate on that saved sample:
+#    python eval_static/eval_static_math.py --config eval_static/config.yaml
+
+sampling:
+  profile: paper
+  seed: 0
+  output_dir: results/static_eval/math_v0
+  datasets:
+    - gsm8k
+    - mmlu-abstract
+    - mmlu-college
+    - math-algebra
+    - math-counting
+    - math-geometry
+    - math-number
+    - math-intermediate
+    - math-prealgebra
+    - math-precalculus
+    - aime-2025
+    - aime-2026
+    - olympiad-math
+
+evaluation:
+  sample_file: results/static_eval/math_v0/sampled_items.jsonl
+  judge_model: gpt-4.1-mini
+  use_litellm: true
+  output_dir: results/static_eval/math_v0
+  save_every: 50
+  resume: true
+  models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct

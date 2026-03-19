@@ -10,6 +10,7 @@ __pycache__/
 *.err
 *.out
 *.log
+results/
 data/arena_140k.json
 data/arena_140k_math.json
 rm_test.py

@@ -16,6 +16,7 @@ Expected environment variables:
 Usage examples:
     python model_api_smoke_test.py
     python model_api_smoke_test.py --models gpt-5.4 claude-sonnet-4-6
+    python model_api_smoke_test.py --use-litellm
     python model_api_smoke_test.py --json-out smoke_test_results.json
 """
 
@@ -44,32 +45,77 @@ class ModelSpec:
     provider: str
     model_id: str
     api_env: str
+    litellm_model_id: str | None = None
 
 
 MODEL_SPECS: list[ModelSpec] = [
-    ModelSpec("gpt-5.4", "openai", "openai", "gpt-5.4", "OPENAI_API_KEY"),
-    ModelSpec("gpt-5-mini", "openai", "openai", "gpt-5-mini", "OPENAI_API_KEY"),
-    ModelSpec("gpt-4.1", "openai", "openai", "gpt-4.1", "OPENAI_API_KEY"),
-    ModelSpec("gpt-4.1-mini", "openai", "openai", "gpt-4.1-mini", "OPENAI_API_KEY"),
-    ModelSpec("claude-opus-4-6", "anthropic", "anthropic", "claude-opus-4-6", "ANTHROPIC_API_KEY"),
-    ModelSpec("claude-sonnet-4-6", "anthropic", "anthropic", "claude-sonnet-4-6", "ANTHROPIC_API_KEY"),
+    ModelSpec("gpt-5.4", "openai", "openai", "gpt-5.4", "OPENAI_API_KEY", "openai/gpt-5.4"),
+    ModelSpec("gpt-5-mini", "openai", "openai", "gpt-5-mini", "OPENAI_API_KEY", "openai/gpt-5-mini"),
+    ModelSpec("gpt-4.1", "openai", "openai", "gpt-4.1", "OPENAI_API_KEY", "openai/gpt-4.1"),
+    ModelSpec(
+        "gpt-4.1-mini",
+        "openai",
+        "openai",
+        "gpt-4.1-mini",
+        "OPENAI_API_KEY",
+        "openai/gpt-4.1-mini",
+    ),
+    ModelSpec(
+        "claude-opus-4-6",
+        "anthropic",
+        "anthropic",
+        "claude-opus-4-6",
+        "ANTHROPIC_API_KEY",
+        "claude-opus-4-6",
+    ),
+    ModelSpec(
+        "claude-sonnet-4-6",
+        "anthropic",
+        "anthropic",
+        "claude-sonnet-4-6",
+        "ANTHROPIC_API_KEY",
+        "claude-sonnet-4-6",
+    ),
     ModelSpec(
         "claude-haiku-4-5",
         "anthropic",
         "anthropic",
         "claude-haiku-4-5-20251001",
         "ANTHROPIC_API_KEY",
+        "vertex_ai/claude-haiku-4-5@20251001",
     ),
-    ModelSpec("gemini-3.1-pro", "google", "google", "gemini-3.1-pro-preview", "GOOGLE_API_KEY"),
-    ModelSpec("gemini-2.5-pro", "google", "google", "gemini-2.5-pro", "GOOGLE_API_KEY"),
-    ModelSpec("gemini-2.5-flash", "google", "google", "gemini-2.5-flash", "GOOGLE_API_KEY"),
-    ModelSpec("grok-4", "xai", "openrouter", "x-ai/grok-4.20-beta", "OPENROUTER_API_KEY"),
+    ModelSpec(
+        "gemini-3.1-pro",
+        "google",
+        "google",
+        "gemini-3.1-pro-preview",
+        "GOOGLE_API_KEY",
+        "gemini/gemini-3.1-pro-preview",
+    ),
+    ModelSpec(
+        "gemini-2.5-pro",
+        "google",
+        "google",
+        "gemini-2.5-pro",
+        "GOOGLE_API_KEY",
+        "gemini/gemini-2.5-pro",
+    ),
+    ModelSpec(
+        "gemini-2.5-flash",
+        "google",
+        "google",
+        "gemini-2.5-flash",
+        "GOOGLE_API_KEY",
+        "gemini/gemini-2.5-flash",
+    ),
+    ModelSpec("grok-4", "xai", "openrouter", "x-ai/grok-4.20-beta", "OPENROUTER_API_KEY", None),
     ModelSpec(
         "deepseek-v3.2",
         "deepseek",
         "openrouter",
         "deepseek/deepseek-v3.2",
         "OPENROUTER_API_KEY",
+        None,
     ),
     ModelSpec(
         "deepseek-r1", 
@@ -77,6 +123,7 @@ MODEL_SPECS: list[ModelSpec] = [
         "openrouter", 
         "deepseek/deepseek-r1-0528", 
         "OPENROUTER_API_KEY",
+        None,
     ),
     ModelSpec(
         "mistral-large-3",
@@ -84,6 +131,7 @@ MODEL_SPECS: list[ModelSpec] = [
         "openrouter",
         "mistralai/mistral-large-2512",
         "OPENROUTER_API_KEY",
+        None,
     ),
     ModelSpec(
         "qwen3-max-thinking",
@@ -91,6 +139,7 @@ MODEL_SPECS: list[ModelSpec] = [
         "openrouter",
         "qwen/qwen3-max-thinking",
         "OPENROUTER_API_KEY",
+        None,
     ),
     ModelSpec(
         "llama-4-maverick-instruct",
@@ -98,10 +147,23 @@ MODEL_SPECS: list[ModelSpec] = [
         "openrouter",
         "meta-llama/llama-4-maverick-17b-128e-instruct",
         "OPENROUTER_API_KEY",
+        None,
     ),
 ]
 
 MODEL_LOOKUP = {spec.label: spec for spec in MODEL_SPECS}
+
+
+def should_use_litellm_for_model(spec: ModelSpec, *, use_litellm: bool) -> bool:
+    return use_litellm and spec.litellm_model_id is not None
+
+
+def get_routed_model_id(spec: ModelSpec, *, use_litellm: bool) -> str:
+    if use_litellm:
+        if not spec.litellm_model_id:
+            raise ValueError(f"LiteLLM mapping is not configured for model '{spec.label}'.")
+        return spec.litellm_model_id
+    return spec.model_id
 
 
 @dataclass
@@ -202,6 +264,11 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Request timeout in seconds for each call (default: 60).",
     )
+    parser.add_argument(
+        "--use-litellm",
+        action="store_true",
+        help="Route all model calls through a single OpenAI-compatible LiteLLM endpoint.",
+    )
     return parser.parse_args()
 
 
@@ -221,21 +288,43 @@ def load_env_file(env_path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def build_clients(selected_specs: list[ModelSpec]) -> dict[str, Any]:
+def resolve_env_path() -> Path:
+    here = Path(__file__).resolve()
+    local_env = here.with_name(".env")
+    if local_env.exists():
+        return local_env
+    return here.parent.parent / ".env"
+
+
+def build_clients(
+    selected_specs: list[ModelSpec],
+    *,
+    timeout: int,
+    use_litellm: bool,
+) -> dict[str, Any]:
     clients: dict[str, Any] = {}
     providers = {spec.provider for spec in selected_specs}
+
+    if use_litellm:
+        key = get_env_value("LITELLM_API_KEY", "OPENAI_API_KEY")
+        base_url = normalize_base_url(
+            get_env_value("LITELLM_BASE_URL", "OPENAI_BASE_URL"),
+            "openai",
+        )
+        if key and base_url:
+            clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
 
     if "openai" in providers:
         key = get_env_value("OPENAI_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("OPENAI_BASE_URL"), "openai")
-            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=60)
+            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=timeout)
 
     if "anthropic" in providers:
         key = get_env_value("ANTHROPIC_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("ANTHROPIC_BASE_URL"), "anthropic")
-            clients["anthropic"] = anthropic.Anthropic(api_key=key, base_url=base_url, timeout=60)
+            clients["anthropic"] = anthropic.Anthropic(api_key=key, base_url=base_url, timeout=timeout)
 
     if "google" in providers:
         key = get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
@@ -245,7 +334,7 @@ def build_clients(selected_specs: list[ModelSpec]) -> dict[str, Any]:
                 clients["google_openai_compat"] = OpenAI(
                     base_url=gemini_base_url,
                     api_key=key,
-                    timeout=60,
+                    timeout=timeout,
                 )
 
     if "openrouter" in providers:
@@ -254,21 +343,34 @@ def build_clients(selected_specs: list[ModelSpec]) -> dict[str, Any]:
             clients["openrouter"] = OpenAI(
                 base_url="https://openrouter.ai/api/v1",
                 api_key=key,
-                timeout=60,
+                timeout=timeout,
             )
 
     return clients
 
 
-def call_model(spec: ModelSpec, clients: dict[str, Any], timeout: int) -> SmokeTestResult:
+def call_model(
+    spec: ModelSpec,
+    clients: dict[str, Any],
+    timeout: int,
+    *,
+    use_litellm: bool,
+) -> SmokeTestResult:
     start = time.time()
 
-    if spec.provider == "google":
+    routed_via_litellm = should_use_litellm_for_model(spec, use_litellm=use_litellm)
+
+    if routed_via_litellm:
+        has_required_key = bool(get_env_value("LITELLM_API_KEY", "OPENAI_API_KEY"))
+        has_required_base_url = bool(get_env_value("LITELLM_BASE_URL", "OPENAI_BASE_URL"))
+    elif spec.provider == "google":
         has_required_key = bool(get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+        has_required_base_url = True
     else:
         has_required_key = bool(get_env_value(spec.api_env))
+        has_required_base_url = True
 
-    if not has_required_key:
+    if not has_required_key or not has_required_base_url:
         return SmokeTestResult(
             label=spec.label,
             provider=spec.provider,
@@ -277,6 +379,9 @@ def call_model(spec: ModelSpec, clients: dict[str, Any], timeout: int) -> SmokeT
             latency_s=None,
             response_text=None,
             error=(
+                "Missing LITELLM_API_KEY/OPENAI_API_KEY or LITELLM_BASE_URL/OPENAI_BASE_URL"
+                if routed_via_litellm
+                else
                 "Missing GOOGLE_API_KEY or GEMINI_API_KEY"
                 if spec.provider == "google"
                 else f"Missing {spec.api_env}"
@@ -284,7 +389,11 @@ def call_model(spec: ModelSpec, clients: dict[str, Any], timeout: int) -> SmokeT
         )
 
     try:
-        if spec.provider == "openai":
+        if routed_via_litellm:
+            routed_model_id = get_routed_model_id(spec, use_litellm=True)
+            text = call_openai_compatible(clients["litellm"], routed_model_id, PROMPT)
+
+        elif spec.provider == "openai":
             text = call_openai_compatible(clients["openai"], spec.model_id, PROMPT)
 
         elif spec.provider == "anthropic":
@@ -352,11 +461,14 @@ def print_summary(results: list[SmokeTestResult]) -> None:
 
 def main() -> None:
     args = parse_args()
-    load_env_file(Path(__file__).with_name(".env"))
+    load_env_file(resolve_env_path())
 
     selected_specs = [MODEL_LOOKUP[label] for label in args.models]
-    clients = build_clients(selected_specs)
-    results = [call_model(spec, clients, args.timeout) for spec in selected_specs]
+    clients = build_clients(selected_specs, timeout=args.timeout, use_litellm=args.use_litellm)
+    results = [
+        call_model(spec, clients, args.timeout, use_litellm=args.use_litellm)
+        for spec in selected_specs
+    ]
 
     print_summary(results)
 

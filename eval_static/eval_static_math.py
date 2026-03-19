@@ -11,11 +11,13 @@ Usage examples:
     python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl
     python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl --models gpt-5.4 claude-opus-4-6
     python eval_static/eval_static_math.py --sample-file results/static_samples/run1/sampled_items.jsonl --judge-model gpt-4.1-mini
+    python eval_static/eval_static_math.py --config eval_static/config_static.yaml --use-litellm
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -40,6 +42,8 @@ from model_api_smoke_test import (
     MODEL_LOOKUP,
     MODEL_SPECS,
     extract_chat_content,
+    get_routed_model_id,
+    should_use_litellm_for_model,
     get_env_value,
     load_env_file,
     normalize_base_url,
@@ -269,6 +273,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume from existing partial results in the output directory.",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Number of question items to evaluate in parallel (default: 4). Use 1 for serial execution.",
+    )
+    parser.add_argument(
+        "--use-litellm",
+        action="store_true",
+        help="Route all model and judge calls through a single OpenAI-compatible LiteLLM endpoint.",
+    )
     return parser.parse_args()
 
 
@@ -324,6 +339,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.save_every = int(section.get("save_every", 50))
     if not args.resume:
         args.resume = bool(section.get("resume", False))
+    if args.max_workers == 4:
+        args.max_workers = int(section.get("max_workers", 4))
+    if not args.use_litellm:
+        args.use_litellm = bool(section.get("use_litellm", False))
 
     if not args.sample_file:
         raise SystemExit("Error: --sample-file is required, either via CLI or config file.")
@@ -377,6 +396,23 @@ def build_clients(selected_models: list[str]) -> dict[str, Any]:
 
     if "openai" not in clients:
         sys.exit("OPENAI_API_KEY is required for the judge model.")
+    return clients
+
+
+def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) -> dict[str, Any]:
+    clients = build_clients(selected_models)
+    if use_litellm:
+        key = get_env_value("LITELLM_API_KEY", "OPENAI_API_KEY")
+        base_url = normalize_base_url(
+            get_env_value("LITELLM_BASE_URL", "OPENAI_BASE_URL"),
+            "openai",
+        )
+        if not key or not base_url:
+            sys.exit(
+                "When --use-litellm is enabled, set LITELLM_API_KEY (or OPENAI_API_KEY) "
+                "and LITELLM_BASE_URL (or OPENAI_BASE_URL)."
+            )
+        clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
     return clients
 
 
@@ -501,20 +537,43 @@ def judge_correctness(
     question: str,
     gold_answer: str,
     model_answer: str,
+    use_litellm: bool = False,
 ) -> dict[str, Any]:
     prompt = JUDGE_PROMPT_TEMPLATE.format(
         question=question,
         gold_answer=gold_answer,
         model_answer=model_answer,
     )
-    resp = judge_client.responses.create(
-        model=judge_model,
-        instructions=JUDGE_SYSTEM_INSTRUCTIONS,
-        input=prompt,
-        max_output_tokens=512,
-        store=False,
-    )
-    raw_text = resp.output_text.strip()
+    if use_litellm:
+        request_kwargs: dict[str, Any] = {
+            "model": judge_model,
+            "messages": [
+                {"role": "system", "content": JUDGE_SYSTEM_INSTRUCTIONS},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 512,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            resp = judge_client.chat.completions.create(**request_kwargs)
+        except BadRequestError as exc:
+            message = str(exc).lower()
+            if "response_format" in request_kwargs and "unsupported" in message and "response_format" in message:
+                retry_kwargs = dict(request_kwargs)
+                retry_kwargs.pop("response_format", None)
+                resp = judge_client.chat.completions.create(**retry_kwargs)
+            else:
+                raise
+        raw_text = extract_chat_content(resp.choices[0].message.content).strip()
+    else:
+        resp = judge_client.responses.create(
+            model=judge_model,
+            instructions=JUDGE_SYSTEM_INSTRUCTIONS,
+            input=prompt,
+            max_output_tokens=512,
+            store=False,
+        )
+        raw_text = resp.output_text.strip()
     cleaned = raw_text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -534,7 +593,15 @@ def judge_correctness(
     }
 
 
-def call_model(spec, clients: dict[str, Any], prompt: str) -> str:
+def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False) -> str:
+    if should_use_litellm_for_model(spec, use_litellm=use_litellm):
+        return call_openai_compatible(
+            clients["litellm"],
+            get_routed_model_id(spec, use_litellm=True),
+            user_prompt=prompt,
+            temperature=0.0,
+            max_tokens=2048,
+        )
     if spec.provider == "openai":
         return call_openai_compatible(
             clients["openai"],
@@ -614,15 +681,45 @@ def write_summary_csv(path: Path, summary_rows: list[dict[str, Any]]) -> None:
         writer.writerows(summary_rows)
 
 
+def build_eval_order_lookup(
+    sampled_items: list[dict[str, Any]],
+    selected_model_specs: list[Any],
+) -> dict[str, int]:
+    order_lookup: dict[str, int] = {}
+    order = 0
+    for item in sampled_items:
+        for model_spec in selected_model_specs:
+            order_lookup[make_eval_key(item, model_spec.label)] = order
+            order += 1
+    return order_lookup
+
+
+def order_results(
+    rows: list[dict[str, Any]],
+    eval_order_lookup: dict[str, int],
+) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            eval_order_lookup.get(make_eval_key(row), float("inf")),
+            row["dataset"],
+            row["sample_index"],
+            row["model_label"],
+        ),
+    )
+
+
 def save_checkpoint(
     *,
     output_dir: Path,
     results: list[dict[str, Any]],
+    eval_order_lookup: dict[str, int],
     completed_evals: int,
     total_evals: int,
 ) -> None:
-    write_jsonl(output_dir / "responses.jsonl", results)
-    summary_rows = summarize_results(results)
+    ordered = order_results(results, eval_order_lookup)
+    write_jsonl(output_dir / "responses.jsonl", ordered)
+    summary_rows = summarize_results(ordered)
     write_summary_csv(output_dir / "summary.csv", summary_rows)
     checkpoint = {
         "completed_evals": completed_evals,
@@ -658,6 +755,83 @@ def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summary_rows
 
 
+def evaluate_item(
+    item: dict[str, Any],
+    *,
+    selected_model_specs: list[Any],
+    clients: dict[str, Any],
+    judge_model: str,
+    completed_keys: set[str],
+    use_litellm: bool,
+) -> list[tuple[str, dict[str, Any]]]:
+    item_results: list[tuple[str, dict[str, Any]]] = []
+
+    for model_spec in selected_model_specs:
+        eval_key = make_eval_key(item, model_spec.label)
+        if eval_key in completed_keys:
+            continue
+
+        record: dict[str, Any] = {
+            "dataset": item["dataset"],
+            "dataset_kind": item["dataset_kind"],
+            "sample_index": item["sample_index"],
+            "model_label": model_spec.label,
+            "model_provider": model_spec.provider,
+            "model_id": model_spec.model_id,
+            "level": item["level"],
+            "subject": item["subject"],
+            "question": item["question"],
+            "prompt": item["prompt"],
+            "gold_answer": item["gold_answer"],
+            "status": "ok",
+            "correct": None,
+            "grading_method": "llm_judge",
+            "response_text": None,
+            "judge_reason": None,
+            "judge_raw": None,
+            "latency_s": None,
+        }
+
+        started = time.time()
+        try:
+            response_text = call_model(model_spec, clients, item["prompt"], use_litellm=use_litellm)
+            record["response_text"] = response_text
+            record["latency_s"] = round(time.time() - started, 2)
+        except Exception as exc:
+            record["status"] = "generation_error"
+            record["latency_s"] = round(time.time() - started, 2)
+            record["judge_reason"] = str(exc)
+            item_results.append((eval_key, record))
+            continue
+
+        judge_spec = MODEL_LOOKUP.get(judge_model)
+        judge_uses_litellm = (
+            use_litellm
+            and judge_spec is not None
+            and should_use_litellm_for_model(judge_spec, use_litellm=True)
+        )
+        effective_judge_model = (
+            get_routed_model_id(judge_spec, use_litellm=True)
+            if judge_uses_litellm and judge_spec is not None
+            else judge_model
+        )
+        judged = judge_correctness(
+            clients["litellm"] if judge_uses_litellm else clients["openai"],
+            effective_judge_model,
+            question=item["question"],
+            gold_answer=item["gold_answer"],
+            model_answer=record["response_text"] or "",
+            use_litellm=judge_uses_litellm,
+        )
+        record["correct"] = judged["correct"]
+        record["grading_method"] = judged["method"]
+        record["judge_reason"] = judged["judge_reason"]
+        record["judge_raw"] = judged["judge_raw"]
+        item_results.append((eval_key, record))
+
+    return item_results
+
+
 def print_summary(summary_rows: list[dict[str, Any]]) -> None:
     print("\nAccuracy summary")
     print("-" * 80)
@@ -682,7 +856,15 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_model_specs = [MODEL_LOOKUP[label] for label in args.models]
-    clients = build_clients(args.models)
+    if args.use_litellm:
+        unsupported = [spec.label for spec in selected_model_specs if spec.litellm_model_id is None]
+        if unsupported:
+            sys.exit(
+                "LiteLLM is not configured for these models: "
+                + ", ".join(unsupported)
+                + ". Remove them from the config/models list or add mappings in MODEL_SPECS."
+            )
+    clients = build_clients_with_mode(args.models, use_litellm=args.use_litellm)
     sample_file = Path(args.sample_file)
     sampled_items = load_jsonl(sample_file)
     dataset_counts: dict[str, int] = defaultdict(int)
@@ -695,6 +877,8 @@ def main() -> None:
         "datasets": sorted(dataset_counts.keys()),
         "sample_plan": dict(dataset_counts),
         "judge_model": args.judge_model,
+        "use_litellm": args.use_litellm,
+        "max_workers": args.max_workers,
         "output_dir": str(output_dir),
         "resume": args.resume,
     }
@@ -703,6 +887,7 @@ def main() -> None:
     responses_path = output_dir / "responses.jsonl"
     results: list[dict[str, Any]] = load_jsonl(responses_path) if args.resume else []
     completed_keys = {make_eval_key(record) for record in results}
+    eval_order_lookup = build_eval_order_lookup(sampled_items, selected_model_specs)
     total_evals = len(sampled_items) * len(selected_model_specs)
     completed_evals = len(completed_keys)
     progress = tqdm(
@@ -712,89 +897,70 @@ def main() -> None:
         unit="eval",
     )
 
-    for item in sampled_items:
-        for model_spec in selected_model_specs:
-            eval_key = make_eval_key(item, model_spec.label)
-            if eval_key in completed_keys:
-                continue
+    pending_items = [
+        item
+        for item in sampled_items
+        if any(make_eval_key(item, model_spec.label) not in completed_keys for model_spec in selected_model_specs)
+    ]
+    completed_keys_snapshot = set(completed_keys)
 
-            progress.set_postfix_str(
-                f"{model_spec.label} | {item['dataset']} #{item['sample_index'] + 1}/{dataset_counts[item['dataset']]}",
-                refresh=False,
+    def record_result(eval_key: str, record: dict[str, Any]) -> None:
+        nonlocal completed_evals
+        results.append(record)
+        completed_keys.add(eval_key)
+        progress.set_postfix_str(
+            f"{record['model_label']} | {record['dataset']} #{record['sample_index'] + 1}/{dataset_counts[record['dataset']]}",
+            refresh=False,
+        )
+        progress.update(1)
+        completed_evals += 1
+        if args.save_every > 0 and completed_evals % args.save_every == 0:
+            save_checkpoint(
+                output_dir=output_dir,
+                results=results,
+                eval_order_lookup=eval_order_lookup,
+                completed_evals=completed_evals,
+                total_evals=total_evals,
             )
 
-            record: dict[str, Any] = {
-                "dataset": item["dataset"],
-                "dataset_kind": item["dataset_kind"],
-                "sample_index": item["sample_index"],
-                "model_label": model_spec.label,
-                "model_provider": model_spec.provider,
-                "model_id": model_spec.model_id,
-                "level": item["level"],
-                "subject": item["subject"],
-                "question": item["question"],
-                "prompt": item["prompt"],
-                "gold_answer": item["gold_answer"],
-                "status": "ok",
-                "correct": None,
-                "grading_method": "llm_judge",
-                "response_text": None,
-                "judge_reason": None,
-                "judge_raw": None,
-                "latency_s": None,
-            }
-
-            started = time.time()
-            try:
-                response_text = call_model(model_spec, clients, item["prompt"])
-                record["response_text"] = response_text
-                record["latency_s"] = round(time.time() - started, 2)
-            except Exception as exc:
-                record["status"] = "generation_error"
-                record["latency_s"] = round(time.time() - started, 2)
-                record["judge_reason"] = str(exc)
-                results.append(record)
-                completed_keys.add(eval_key)
-                progress.update(1)
-                completed_evals += 1
-                if args.save_every > 0 and completed_evals % args.save_every == 0:
-                    save_checkpoint(
-                        output_dir=output_dir,
-                        results=results,
-                        completed_evals=completed_evals,
-                        total_evals=total_evals,
-                    )
-                continue
-
-            judged = judge_correctness(
-                clients["openai"],
-                args.judge_model,
-                question=item["question"],
-                gold_answer=item["gold_answer"],
-                model_answer=record["response_text"] or "",
+    if args.max_workers <= 1 or len(pending_items) <= 1:
+        for item in pending_items:
+            item_results = evaluate_item(
+                item,
+                selected_model_specs=selected_model_specs,
+                clients=clients,
+                judge_model=args.judge_model,
+                completed_keys=completed_keys_snapshot,
+                use_litellm=args.use_litellm,
             )
-            record["correct"] = judged["correct"]
-            record["grading_method"] = judged["method"]
-            record["judge_reason"] = judged["judge_reason"]
-            record["judge_raw"] = judged["judge_raw"]
-
-            results.append(record)
-            completed_keys.add(eval_key)
-            progress.update(1)
-            completed_evals += 1
-            if args.save_every > 0 and completed_evals % args.save_every == 0:
-                save_checkpoint(
-                    output_dir=output_dir,
-                    results=results,
-                    completed_evals=completed_evals,
-                    total_evals=total_evals,
+            for eval_key, record in item_results:
+                record_result(eval_key, record)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_item,
+                    item,
+                    selected_model_specs=selected_model_specs,
+                    clients=clients,
+                    judge_model=args.judge_model,
+                    completed_keys=completed_keys_snapshot,
+                    use_litellm=args.use_litellm,
                 )
+                for item in pending_items
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                item_results = future.result()
+                for eval_key, record in item_results:
+                    record_result(eval_key, record)
 
     progress.close()
-    summary_rows = summarize_results(results)
+    ordered_results = order_results(results, eval_order_lookup)
+    summary_rows = summarize_results(ordered_results)
     save_checkpoint(
         output_dir=output_dir,
         results=results,
+        eval_order_lookup=eval_order_lookup,
         completed_evals=completed_evals,
         total_evals=total_evals,
     )
