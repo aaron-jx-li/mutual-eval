@@ -22,7 +22,7 @@ import re
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -135,6 +135,16 @@ def parse_args() -> argparse.Namespace:
         help="Resume from an existing responses.jsonl in the output directory.",
     )
     parser.add_argument(
+        "--retry-statuses",
+        nargs="*",
+        default=None,
+        choices=("generation_error", "reward_error"),
+        help=(
+            "When resuming, retry prior rows with these statuses instead of "
+            "treating them as completed. Defaults to config or ['generation_error']."
+        ),
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=None,
@@ -195,6 +205,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.use_litellm = bool(section.get("use_litellm", False))
     if not args.resume:
         args.resume = bool(section.get("resume", False))
+    if args.retry_statuses is None:
+        args.retry_statuses = list(section.get("retry_statuses", ["generation_error"]))
     if args.max_rows is None and section.get("max_rows") is not None:
         args.max_rows = int(section.get("max_rows"))
     return args
@@ -485,6 +497,24 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def split_resume_results(
+    rows: list[dict[str, Any]],
+    *,
+    retry_statuses: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split prior rows into kept results and rows that should be retried."""
+    if not retry_statuses:
+        return rows, []
+    kept: list[dict[str, Any]] = []
+    retried: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("status") in retry_statuses:
+            retried.append(row)
+        else:
+            kept.append(row)
+    return kept, retried
+
+
 def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -670,7 +700,15 @@ def main() -> None:
 
     eval_order_lookup = build_eval_order_lookup(items, selected_model_specs)
     responses_path = output_dir / "responses.jsonl"
-    results: list[dict[str, Any]] = load_jsonl(responses_path) if args.resume else []
+    results: list[dict[str, Any]] = []
+    retried_results: list[dict[str, Any]] = []
+    retry_statuses = set(args.retry_statuses or [])
+    if args.resume:
+        existing_results = load_jsonl(responses_path)
+        results, retried_results = split_resume_results(
+            existing_results,
+            retry_statuses=retry_statuses,
+        )
     completed_keys = {make_eval_key(record) for record in results}
     total_evals = len(items) * len(selected_model_specs)
     completed_evals = len(completed_keys)
@@ -687,12 +725,18 @@ def main() -> None:
         "reward_timeout": args.reward_timeout,
         "reward_max_concurrency": min(args.reward_max_concurrency, 8),
         "use_litellm": args.use_litellm,
+        "retry_statuses": sorted(retry_statuses),
         "max_rows": args.max_rows,
         "rm_base_url": rm_base_url,
         "total_items": len(items),
         "total_evals": total_evals,
     }
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+
+    if retried_results:
+        retry_counts = Counter(str(row.get("status", "unknown")) for row in retried_results)
+        retry_summary = ", ".join(f"{status}={count}" for status, count in sorted(retry_counts.items()))
+        print(f"Retrying prior failed rows on resume: {retry_summary}")
 
     progress = tqdm(
         total=total_evals,

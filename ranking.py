@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
 """
 Unified IRT-based ranking of LLMs using static benchmarks, arena pairwise
-preferences, or both jointly.
+preferences, continuous reward signals, or combinations thereof.
 
 Usage examples:
-    # Static-only 2PL IRT
+    # Static-only 2PL IRT (CSV)
     python ranking.py --mode static --static-csv ./data/static_10_models.csv
 
-    # Arena-only pairwise IRT
+    # Static-only 2PL IRT (JSONL from static_eval pipeline)
+    python ranking.py --mode static \\
+        --static-jsonl results/static_eval/math_v0/responses.jsonl
+
+    # Arena-only pairwise IRT (CSV)
     python ranking.py --mode arena --arena-csv ./data/pairwise_results_900.csv
 
-    # Joint model (static + arena)
+    # Reward regression IRT (JSONL from arena_eval pipeline)
+    python ranking.py --mode reward \\
+        --arena-reward-jsonl results/arena_eval/math_v0/responses.jsonl
+
+    # Joint: static binary + arena reward regression
+    python ranking.py --mode both-reward \\
+        --static-jsonl results/static_eval/math_v0/responses.jsonl \\
+        --arena-reward-jsonl results/arena_eval/math_v0/responses.jsonl
+
+    # Joint model (static + arena pairwise, CSV)
     python ranking.py --mode both \\
         --static-csv ./data/static_10_models.csv \\
         --arena-csv ./data/pairwise_results_900.csv
 
     # Customise training and evaluation
-    python ranking.py --mode both \\
-        --static-csv ./data/static_10_models.csv \\
-        --arena-csv ./data/pairwise_results_900.csv \\
-        --num-epochs 5000 --lr 0.05 --lambda-bb 0.3 \\
+    python ranking.py --mode both-reward \\
+        --static-jsonl results/static_eval/math_v0/responses.jsonl \\
+        --arena-reward-jsonl results/arena_eval/math_v0/responses.jsonl \\
+        --num-epochs 5000 --lr 0.05 --lambda-static 1.0 --lambda-arena 1.0 \\
         --evaluate --save-plot ./figures/ranking.pdf
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from itertools import combinations
 
 import matplotlib.pyplot as plt
@@ -108,6 +122,63 @@ def build_pairwise_from_static(static_df: pd.DataFrame) -> pd.DataFrame:
                     "model_1": r1["model_name"],
                     "model_2": r2["model_name"],
                     "outcome": outcome,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# =====================================================================
+# JSONL loaders for the static_eval / arena_eval pipeline
+# =====================================================================
+
+def load_static_jsonl(jsonl_path: str) -> pd.DataFrame:
+    """
+    Load a static_eval responses.jsonl file.
+
+    Expected fields per line:
+        model_label, dataset, sample_index, correct (bool)
+
+    Returns a DataFrame with columns:
+        model_name, question_id, judge_result (0/1 int)
+    """
+    rows: list[dict] = []
+    with open(jsonl_path) as f:
+        for line in f:
+            d = json.loads(line)
+            if d.get("status") != "ok":
+                continue
+            rows.append(
+                {
+                    "model_name": d["model_label"],
+                    "question_id": f"{d['dataset']}_{d['sample_index']}",
+                    "judge_result": int(bool(d["correct"])),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def load_arena_reward_jsonl(jsonl_path: str) -> pd.DataFrame:
+    """
+    Load an arena_eval responses.jsonl file that contains per-response
+    continuous reward scores.
+
+    Expected fields per line:
+        model_label, item_id, reward (float)
+
+    Returns a DataFrame with columns:
+        model_name, question_id, reward
+    """
+    rows: list[dict] = []
+    with open(jsonl_path) as f:
+        for line in f:
+            d = json.loads(line)
+            if d.get("status") != "ok" or d.get("reward") is None:
+                continue
+            rows.append(
+                {
+                    "model_name": d["model_label"],
+                    "question_id": d["item_id"],
+                    "reward": float(d["reward"]),
                 }
             )
     return pd.DataFrame(rows)
@@ -581,6 +652,265 @@ def fit_joint_irt(
     return model_params, question_params
 
 
+def fit_reward_irt(
+    reward_df: pd.DataFrame,
+    *,
+    num_epochs: int = 2000,
+    lr: float = 0.05,
+    reg_lambda: float = 1e-4,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Direct-regression IRT on continuous reward signals.
+
+    Formulation
+    -----------
+    The reward r_{i,q} is treated as a noisy observation of the model's
+    latent performance on question q:
+
+        r_{i,q} = a_q * (theta_i - b_q) + eps,   a_q = exp(k_q)
+
+    This is a continuous / graded-response IRT variant.  Because the
+    arena_eval rewards are already on a roughly logit-like scale
+    (~[-2.5, 2.8] centred near 0) they map naturally onto the IRT
+    logit axis without any re-scaling.
+
+    Loss: MSE(a_q * (theta_i - b_q), r_{i,q}) + L2 regularisation.
+
+    Returns (model_params, question_params) DataFrames.
+    """
+    df = reward_df.copy()
+    df["model_cat"] = df["model_name"].astype("category")
+    df["question_cat"] = df["question_id"].astype("category")
+    df["model_idx"] = df["model_cat"].cat.codes
+    df["question_idx"] = df["question_cat"].cat.codes
+
+    n_models = df["model_idx"].nunique()
+    n_questions = df["question_idx"].nunique()
+
+    device = _get_device()
+    m_idx = torch.tensor(df["model_idx"].values, dtype=torch.long, device=device)
+    q_idx = torch.tensor(df["question_idx"].values, dtype=torch.long, device=device)
+    r = torch.tensor(df["reward"].values, dtype=torch.float32, device=device)
+
+    theta = nn.Embedding(n_models, 1, device=device)
+    b = nn.Embedding(n_questions, 1, device=device)
+    k = nn.Embedding(n_questions, 1, device=device)
+    nn.init.zeros_(theta.weight)
+    nn.init.zeros_(b.weight)
+    nn.init.zeros_(k.weight)
+
+    optimizer = optim.Adam(
+        list(theta.parameters()) + list(b.parameters()) + list(k.parameters()),
+        lr=lr,
+    )
+    mse = nn.MSELoss()
+
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+
+        theta_i = theta(m_idx).squeeze(-1)
+        b_q = b(q_idx).squeeze(-1)
+        k_q = k(q_idx).squeeze(-1)
+        a_q = torch.exp(k_q)
+
+        pred = a_q * (theta_i - b_q)
+        loss = mse(pred, r) + reg_lambda * (
+            theta.weight.pow(2).mean()
+            + b.weight.pow(2).mean()
+            + k.weight.pow(2).mean()
+        )
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            shift = theta.weight.mean()
+            theta.weight.sub_(shift)
+            b.weight.sub_(shift)
+
+        if verbose and (epoch % 500 == 0 or epoch == num_epochs - 1):
+            print(f"  Epoch {epoch:5d} | loss = {loss.item():.4f}")
+
+    theta_np = theta.weight.detach().cpu().numpy().squeeze(-1)
+    b_np = b.weight.detach().cpu().numpy().squeeze(-1)
+    k_np = k.weight.detach().cpu().numpy().squeeze(-1)
+
+    model_params = (
+        pd.DataFrame(
+            {"model_name": df["model_cat"].cat.categories, "theta": theta_np}
+        )
+        .sort_values("theta", ascending=False)
+        .reset_index(drop=True)
+    )
+    question_params = (
+        pd.DataFrame(
+            {
+                "question_id": df["question_cat"].cat.categories,
+                "difficulty_b": b_np,
+                "k_raw": k_np,
+                "discrimination_exp_k": np.exp(k_np),
+            }
+        )
+        .sort_values("difficulty_b", ascending=False)
+        .reset_index(drop=True)
+    )
+    return model_params, question_params
+
+
+def fit_joint_reward_irt(
+    static_df: pd.DataFrame,
+    reward_df: pd.DataFrame,
+    *,
+    num_epochs: int = 2000,
+    lr: float = 0.02,
+    lambda_static: float = 1.0,
+    lambda_reward: float = 1.0,
+    reg_lambda: float = 1e-4,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Joint 2PL-IRT (static binary) + continuous reward regression (arena).
+
+    Static:  P(correct_{i,q}) = sigmoid(a_q * (theta_i - b_q))   [BCE]
+    Reward:  r_{i,q}          = a_q * (theta_i - b_q) + eps      [MSE]
+
+    Both signal sources share the same (theta, b, k) embeddings, so the
+    reward data directly informs ability/difficulty estimates even for
+    (model, question) pairs not covered by the static benchmark.
+
+    lambda_static and lambda_reward control the relative contribution of
+    each loss term.  Because BCE and MSE operate on different scales,
+    start with lambda_static=1.0, lambda_reward=1.0 and tune if needed.
+    """
+    static = static_df.copy()
+    reward = reward_df.copy()
+
+    all_models = pd.Index(
+        pd.unique(
+            pd.concat(
+                [static["model_name"], reward["model_name"]], ignore_index=True
+            )
+        ),
+        name="model_name",
+    )
+    all_questions = pd.Index(
+        pd.unique(
+            pd.concat(
+                [static["question_id"], reward["question_id"]], ignore_index=True
+            )
+        ),
+        name="question_id",
+    )
+
+    model_to_idx = {m: i for i, m in enumerate(all_models)}
+    q_to_idx = {q: i for i, q in enumerate(all_questions)}
+
+    static = static[
+        static["model_name"].isin(all_models) & static["question_id"].isin(all_questions)
+    ].copy()
+    static["m_idx"] = static["model_name"].map(model_to_idx)
+    static["q_idx"] = static["question_id"].map(q_to_idx)
+
+    reward = reward[
+        reward["model_name"].isin(all_models) & reward["question_id"].isin(all_questions)
+    ].copy()
+    reward["m_idx"] = reward["model_name"].map(model_to_idx)
+    reward["q_idx"] = reward["question_id"].map(q_to_idx)
+
+    device = _get_device()
+
+    # Static tensors
+    m_s = torch.tensor(static["m_idx"].values, dtype=torch.long, device=device)
+    q_s = torch.tensor(static["q_idx"].values, dtype=torch.long, device=device)
+    y_s = torch.tensor(static["judge_result"].values, dtype=torch.float32, device=device)
+
+    # Reward tensors
+    m_r = torch.tensor(reward["m_idx"].values, dtype=torch.long, device=device)
+    q_r = torch.tensor(reward["q_idx"].values, dtype=torch.long, device=device)
+    r_target = torch.tensor(reward["reward"].values, dtype=torch.float32, device=device)
+
+    n_models = len(all_models)
+    n_questions = len(all_questions)
+
+    theta = nn.Embedding(n_models, 1, device=device)
+    b = nn.Embedding(n_questions, 1, device=device)
+    k = nn.Embedding(n_questions, 1, device=device)
+    nn.init.zeros_(theta.weight)
+    nn.init.zeros_(b.weight)
+    nn.init.zeros_(k.weight)
+
+    optimizer = optim.Adam(
+        list(theta.parameters()) + list(b.parameters()) + list(k.parameters()),
+        lr=lr,
+    )
+    bce = nn.BCEWithLogitsLoss()
+    mse = nn.MSELoss()
+
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+
+        # -- Static 2PL --
+        ts = theta(m_s).squeeze(-1)
+        bs = b(q_s).squeeze(-1)
+        ks = k(q_s).squeeze(-1)
+        logits_s = torch.exp(ks) * (ts - bs)
+        loss_static = bce(logits_s, y_s)
+
+        # -- Reward regression --
+        tr = theta(m_r).squeeze(-1)
+        br = b(q_r).squeeze(-1)
+        kr = k(q_r).squeeze(-1)
+        pred_r = torch.exp(kr) * (tr - br)
+        loss_reward = mse(pred_r, r_target)
+
+        # -- Regularisation --
+        reg = reg_lambda * (
+            theta.weight.pow(2).mean()
+            + b.weight.pow(2).mean()
+            + k.weight.pow(2).mean()
+        )
+
+        total = lambda_static * loss_static + lambda_reward * loss_reward + reg
+        total.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            shift = theta.weight.mean()
+            theta.weight.sub_(shift)
+            b.weight.sub_(shift)
+
+        if verbose and (epoch % 500 == 0 or epoch == num_epochs - 1):
+            print(
+                f"  Epoch {epoch:5d} | "
+                f"static={loss_static.item():.4f}  "
+                f"reward={loss_reward.item():.4f}  "
+                f"total={total.item():.4f}"
+            )
+
+    theta_np = theta.weight.detach().cpu().numpy().squeeze(-1)
+    b_np = b.weight.detach().cpu().numpy().squeeze(-1)
+    k_np = k.weight.detach().cpu().numpy().squeeze(-1)
+
+    model_params = (
+        pd.DataFrame({"model_name": all_models, "theta": theta_np})
+        .sort_values("theta", ascending=False)
+        .reset_index(drop=True)
+    )
+    question_params = (
+        pd.DataFrame(
+            {
+                "question_id": all_questions,
+                "difficulty_b": b_np,
+                "k_raw": k_np,
+                "discrimination_exp_k": np.exp(k_np),
+            }
+        )
+        .sort_values("difficulty_b", ascending=False)
+        .reset_index(drop=True)
+    )
+    return model_params, question_params
+
+
 # =====================================================================
 # Evaluation helpers
 # =====================================================================
@@ -842,18 +1172,38 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--mode", required=True, choices=["static", "arena", "both"],
-                   help="Which data sources to fit on.")
+    p.add_argument(
+        "--mode", required=True,
+        choices=["static", "arena", "both", "reward", "both-reward"],
+        help=(
+            "Which data sources and formulation to use. "
+            "'reward' = direct regression on arena reward signals; "
+            "'both-reward' = joint static binary + arena reward regression."
+        ),
+    )
+
+    # CSV inputs (original pipeline)
     p.add_argument("--static-csv", default=None, help="Path to static benchmark CSV.")
     p.add_argument("--arena-csv", default=None, help="Path to arena pairwise CSV.")
+
+    # JSONL inputs (static_eval / arena_eval pipeline)
+    p.add_argument(
+        "--static-jsonl", default=None,
+        help="Path to static_eval responses.jsonl (fields: model_label, dataset, sample_index, correct).",
+    )
+    p.add_argument(
+        "--arena-reward-jsonl", default=None,
+        help="Path to arena_eval responses.jsonl with continuous reward scores (fields: model_label, item_id, reward).",
+    )
 
     # Training hyper-parameters
     p.add_argument("--num-epochs", type=int, default=2000, help="Training epochs (default: 2000).")
     p.add_argument("--lr", type=float, default=0.05, help="Learning rate (default: 0.05).")
-    p.add_argument("--lambda-static", type=float, default=1.0, help="Weight for static loss (both mode).")
-    p.add_argument("--lambda-arena", type=float, default=1.0, help="Weight for arena loss (both mode).")
-    p.add_argument("--lambda-tie", type=float, default=0.0, help="Weight for tie loss (default: 0.0).")
-    p.add_argument("--lambda-bb", type=float, default=1.0, help="Weight for both-bad loss (default: 1.0).")
+    p.add_argument("--lambda-static", type=float, default=1.0, help="Weight for static loss (both / both-reward mode).")
+    p.add_argument("--lambda-arena", type=float, default=1.0, help="Weight for arena pairwise loss (both mode).")
+    p.add_argument("--lambda-reward", type=float, default=1.0, help="Weight for reward regression loss (reward / both-reward mode).")
+    p.add_argument("--lambda-tie", type=float, default=0.0, help="Weight for tie loss (arena / both mode, default: 0.0).")
+    p.add_argument("--lambda-bb", type=float, default=1.0, help="Weight for both-bad loss (arena / both mode, default: 1.0).")
 
     # Output / evaluation
     p.add_argument("--save-plot", default=None, help="Path to save the ranking plot (e.g. ./figures/ranking.pdf).")
@@ -869,24 +1219,50 @@ def main() -> None:
 
     static_df = None
     arena_df = None
+    reward_df = None
 
     # ── Validate and load data ───────────────────────────────────────
     if args.mode in ("static", "both"):
-        if not args.static_csv:
-            raise SystemExit("Error: --static-csv is required for mode '{}'.".format(args.mode))
-        print(f"Loading static data from {args.static_csv} ...")
-        static_df = pd.read_csv(args.static_csv)
+        if args.static_jsonl:
+            print(f"Loading static data from {args.static_jsonl} ...")
+            static_df = load_static_jsonl(args.static_jsonl)
+        elif args.static_csv:
+            print(f"Loading static data from {args.static_csv} ...")
+            static_df = pd.read_csv(args.static_csv)
+        else:
+            raise SystemExit(f"Error: --static-csv or --static-jsonl is required for mode '{args.mode}'.")
         print(f"  {len(static_df)} rows, {static_df['model_name'].nunique()} models, "
               f"{static_df['question_id'].nunique()} questions")
 
     if args.mode in ("arena", "both"):
         if not args.arena_csv:
-            raise SystemExit("Error: --arena-csv is required for mode '{}'.".format(args.mode))
+            raise SystemExit(f"Error: --arena-csv is required for mode '{args.mode}'.")
         print(f"Loading arena data from {args.arena_csv} ...")
         arena_df = load_arena_pairs(args.arena_csv)
         n_arena_models = pd.unique(pd.concat([arena_df["model_1"], arena_df["model_2"]])).shape[0]
         print(f"  {len(arena_df)} pairs, {n_arena_models} models, "
               f"{arena_df['question_id'].nunique()} questions")
+
+    if args.mode in ("reward", "both-reward"):
+        if not args.arena_reward_jsonl:
+            raise SystemExit(f"Error: --arena-reward-jsonl is required for mode '{args.mode}'.")
+        print(f"Loading arena reward data from {args.arena_reward_jsonl} ...")
+        reward_df = load_arena_reward_jsonl(args.arena_reward_jsonl)
+        print(f"  {len(reward_df)} rows, {reward_df['model_name'].nunique()} models, "
+              f"{reward_df['question_id'].nunique()} questions, "
+              f"reward mean={reward_df['reward'].mean():.3f} std={reward_df['reward'].std():.3f}")
+
+    if args.mode == "both-reward":
+        if args.static_jsonl:
+            print(f"Loading static data from {args.static_jsonl} ...")
+            static_df = load_static_jsonl(args.static_jsonl)
+        elif args.static_csv:
+            print(f"Loading static data from {args.static_csv} ...")
+            static_df = pd.read_csv(args.static_csv)
+        else:
+            raise SystemExit("Error: --static-csv or --static-jsonl is required for mode 'both-reward'.")
+        print(f"  {len(static_df)} rows, {static_df['model_name'].nunique()} models, "
+              f"{static_df['question_id'].nunique()} questions")
 
     # ── Fit ──────────────────────────────────────────────────────────
     print(f"\nFitting IRT model (mode={args.mode}) ...")
@@ -901,13 +1277,26 @@ def main() -> None:
             arena_df, num_epochs=args.num_epochs, lr=args.lr,
             lambda_tie=args.lambda_tie, lambda_bb=args.lambda_bb, verbose=verbose,
         )
-    else:  # both
+    elif args.mode == "both":
         assert static_df is not None and arena_df is not None
         model_params, question_params = fit_joint_irt(
             static_df, arena_df,
             num_epochs=args.num_epochs, lr=args.lr,
             lambda_static=args.lambda_static, lambda_arena=args.lambda_arena,
             lambda_tie=args.lambda_tie, lambda_bb=args.lambda_bb, verbose=verbose,
+        )
+    elif args.mode == "reward":
+        assert reward_df is not None
+        model_params, question_params = fit_reward_irt(
+            reward_df, num_epochs=args.num_epochs, lr=args.lr, verbose=verbose,
+        )
+    else:  # both-reward
+        assert static_df is not None and reward_df is not None
+        model_params, question_params = fit_joint_reward_irt(
+            static_df, reward_df,
+            num_epochs=args.num_epochs, lr=args.lr,
+            lambda_static=args.lambda_static, lambda_reward=args.lambda_reward,
+            verbose=verbose,
         )
 
     # ── Print rankings ───────────────────────────────────────────────

@@ -1,0 +1,25 @@
+{
+  "dataset": "lmarena-ai/arena-expert-5k",
+  "subset": null,
+  "split": "train",
+  "allowed_languages": [
+    "en"
+  ],
+  "judge_model": "gpt-4.1-mini",
+  "min_confidence": 0.5,
+  "max_workers": 8,
+  "judge_api_key_env": "OPENAI_API_KEY",
+  "judge_base_url": "https://api.openai.com/v1",
+  "seed": 0,
+  "max_rows": null,
+  "max_kept": null,
+  "judged_rows": 5128,
+  "kept_rows": 1304,
+  "judge_errors": 0,
+  "status_counts": {
+    "skipped_language": 2096,
+    "ok": 3032
+  },
+  "output": "data/arena_expert_5k_coding.jsonl",
+  "checkpoint": "data/arena_expert_5k_coding_checkpoint.json"
+}

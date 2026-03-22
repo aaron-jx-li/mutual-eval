@@ -1,0 +1,71 @@
+# Arena coding sampling + evaluation config
+#
+# Sampling workflow:
+#   python eval_arena/sample_arena_coding.py --config eval_arena/config_arena_coding.yaml
+#
+# Evaluation workflow:
+#   python eval_arena/eval_arena_coding.py --config eval_arena/config_arena_coding.yaml
+
+sampling:
+  dataset: lmarena-ai/arena-expert-5k
+  split: train
+  allowed_languages:
+    - en
+  judge_model: gpt-4.1-mini
+  judge_api_key_env: OPENAI_API_KEY
+  judge_base_url: https://api.openai.com/v1
+  output: data/arena_expert_5k_coding.jsonl
+  checkpoint: data/arena_expert_5k_coding_checkpoint.json
+  save_every: 100
+  min_confidence: 0.5
+  max_workers: 8
+  resume: true
+  timeout: 60
+  seed: 0
+
+evaluation:
+  input_file: results/arena_eval/coding_v0/arena_expert_5k_coding.jsonl
+  first_k: 500
+  output_dir: results/arena_eval/coding_v0
+  openai_base_url: https://api.openai.com/v1
+  # Optional explicit direct OpenAI endpoint for GPT models.
+  # Example: https://api.openai.com/v1 or https://us.api.openai.com/v1
+  # openai_base_url: https://api.openai.com/v1
+  # If true, route every model with a LiteLLM mapping through LiteLLM.
+  # Leave false to use the default/native routing unless litellm_models is set.
+  use_litellm: false
+  # Optional explicit subset of model labels to route through LiteLLM.
+  # This overrides the default Claude-only LiteLLM routing in eval_arena_coding.py.
+  litellm_models:
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+  # When resuming, retry prior failed rows with these statuses.
+  retry_statuses:
+    - generation_error
+    - reward_error
+  save_every: 100
+  resume: true
+  max_workers: 4
+  generation_timeout: 120
+  generation_max_tokens: 8192
+  reward_timeout: 300
+  reward_max_concurrency: 8
+  rm_base_url: ${ARENA_RM_BASE_URL}
+  rm_token: ${ARENA_RM_TOKEN}
+  models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct
