@@ -5,16 +5,18 @@
 
 evaluation:
   input_file: data/arena_math_900.json
-  output_dir: results/arena_eval/math_v0
-  # eval_arena_math.py currently supports only a global LiteLLM toggle.
-  # Leave false to use native/direct routing like coding by default.
+  output_dir: results/arena_eval/math_v1
   use_litellm: false
+  litellm_models:
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
   save_every: 50
   resume: true
   retry_statuses:
     - generation_error
     - reward_error
-  max_workers: 4
+  max_workers: 8
   generation_timeout: 120
   reward_timeout: 300
   reward_max_concurrency: 8

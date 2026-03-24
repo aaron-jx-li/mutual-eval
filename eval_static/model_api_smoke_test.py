@@ -51,6 +51,7 @@ class ModelSpec:
 MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("gpt-5.4", "openai", "openai", "gpt-5.4", "OPENAI_API_KEY", "openai/gpt-5.4"),
     ModelSpec("gpt-5-mini", "openai", "openai", "gpt-5-mini", "OPENAI_API_KEY", "openai/gpt-5-mini"),
+    ModelSpec("gpt-5.1-mini", "openai", "openai", "gpt-5.1-mini", "OPENAI_API_KEY", "openai/gpt-5.1-mini"),
     ModelSpec("gpt-4.1", "openai", "openai", "gpt-4.1", "OPENAI_API_KEY", "openai/gpt-4.1"),
     ModelSpec(
         "gpt-4.1-mini",

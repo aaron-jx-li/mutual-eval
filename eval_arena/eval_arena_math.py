@@ -52,10 +52,6 @@ from reward_client import RewardClient  # noqa: E402
 
 
 DEFAULT_MODELS = [spec.label for spec in MODEL_SPECS]
-ANSWER_INSTRUCTION = (
-    "Solve the math problem carefully. "
-    "End your response with a final line of the form 'Final answer: <answer>'."
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +124,16 @@ def parse_args() -> argparse.Namespace:
         "--use-litellm",
         action="store_true",
         help="Route supported model calls through LiteLLM and fall back for the rest.",
+    )
+    parser.add_argument(
+        "--litellm-models",
+        nargs="+",
+        default=None,
+        choices=DEFAULT_MODELS,
+        help=(
+            "Explicit subset of model labels to route through LiteLLM. "
+            "When set, this overrides the default Claude-only routing."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -203,6 +209,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.reward_max_concurrency = int(section.get("reward_max_concurrency", 8))
     if not args.use_litellm:
         args.use_litellm = bool(section.get("use_litellm", False))
+    if args.litellm_models is None and section.get("litellm_models") is not None:
+        args.litellm_models = list(section.get("litellm_models", []))
     if not args.resume:
         args.resume = bool(section.get("resume", False))
     if args.retry_statuses is None:
@@ -243,7 +251,7 @@ def build_question_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "item_id": item_id,
                 "row_index": row_index,
                 "question": question,
-                "prompt": f"{question}\n\n{ANSWER_INSTRUCTION}",
+                "prompt": question,
             }
         )
     return items
@@ -355,14 +363,21 @@ def build_clients(selected_models: list[str], generation_timeout: int) -> dict[s
     return clients
 
 
+def _should_use_litellm(spec, *, use_litellm: bool, litellm_models: set[str] | None) -> bool:
+    if litellm_models is not None:
+        return spec.label in litellm_models and spec.litellm_model_id is not None
+    return should_use_litellm_for_model(spec, use_litellm=use_litellm)
+
+
 def build_clients_with_mode(
     selected_models: list[str],
     generation_timeout: int,
     *,
     use_litellm: bool,
+    litellm_models: set[str] | None = None,
 ) -> dict[str, Any]:
     clients = build_clients(selected_models, generation_timeout)
-    if use_litellm:
+    if use_litellm or litellm_models:
         key = get_env_value("LITELLM_API_KEY", "OPENAI_API_KEY")
         base_url = normalize_base_url(
             get_env_value("LITELLM_BASE_URL", "OPENAI_BASE_URL"),
@@ -377,8 +392,8 @@ def build_clients_with_mode(
     return clients
 
 
-def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False) -> str:
-    if should_use_litellm_for_model(spec, use_litellm=use_litellm):
+def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False, litellm_models: set[str] | None = None) -> str:
+    if _should_use_litellm(spec, use_litellm=use_litellm, litellm_models=litellm_models):
         return call_openai_compatible(
             clients["litellm"],
             get_routed_model_id(spec, use_litellm=True),
@@ -497,18 +512,25 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def has_empty_response(record: dict[str, Any]) -> bool:
+    response_text = record.get("response_text")
+    if response_text is None:
+        return True
+    if isinstance(response_text, str):
+        return not response_text.strip()
+    return False
+
+
 def split_resume_results(
     rows: list[dict[str, Any]],
     *,
     retry_statuses: set[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split prior rows into kept results and rows that should be retried."""
-    if not retry_statuses:
-        return rows, []
     kept: list[dict[str, Any]] = []
     retried: list[dict[str, Any]] = []
     for row in rows:
-        if row.get("status") in retry_statuses:
+        if has_empty_response(row) or row.get("status") in retry_statuses:
             retried.append(row)
         else:
             kept.append(row)
@@ -587,6 +609,7 @@ def evaluate_item(
     reward_semaphore: threading.Semaphore,
     completed_keys: set[str],
     use_litellm: bool,
+    litellm_models: set[str] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     item_results: list[tuple[str, dict[str, Any]]] = []
 
@@ -616,9 +639,11 @@ def evaluate_item(
         started = time.time()
         generation_started = time.time()
         try:
-            response_text = call_model(model_spec, clients, item["prompt"], use_litellm=use_litellm)
-            record["response_text"] = response_text
+            response_text = call_model(model_spec, clients, item["prompt"], use_litellm=use_litellm, litellm_models=litellm_models)
             record["generation_latency_s"] = round(time.time() - generation_started, 2)
+            if not response_text.strip():
+                raise ValueError("Empty response text")
+            record["response_text"] = response_text
         except Exception as exc:
             record["status"] = "generation_error"
             record["generation_latency_s"] = round(time.time() - generation_started, 2)
@@ -685,10 +710,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_model_specs = [MODEL_LOOKUP[label] for label in args.models]
+    litellm_models = set(args.litellm_models) if args.litellm_models else None
     clients = build_clients_with_mode(
         args.models,
         args.generation_timeout,
         use_litellm=args.use_litellm,
+        litellm_models=litellm_models,
     )
     reward_client = RewardClient(base_url=rm_base_url, token=rm_token)
     reward_semaphore = threading.BoundedSemaphore(value=min(args.reward_max_concurrency, 8))
@@ -734,7 +761,10 @@ def main() -> None:
     (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
     if retried_results:
-        retry_counts = Counter(str(row.get("status", "unknown")) for row in retried_results)
+        retry_counts = Counter(
+            "empty_response" if has_empty_response(row) else str(row.get("status", "unknown"))
+            for row in retried_results
+        )
         retry_summary = ", ".join(f"{status}={count}" for status, count in sorted(retry_counts.items()))
         print(f"Retrying prior failed rows on resume: {retry_summary}")
 
@@ -782,6 +812,7 @@ def main() -> None:
                 reward_semaphore=reward_semaphore,
                 completed_keys=completed_keys_snapshot,
                 use_litellm=args.use_litellm,
+                litellm_models=litellm_models,
             )
             for eval_key, record in item_results:
                 record_result(eval_key, record)
@@ -798,6 +829,7 @@ def main() -> None:
                     reward_semaphore=reward_semaphore,
                     completed_keys=completed_keys_snapshot,
                     use_litellm=args.use_litellm,
+                    litellm_models=litellm_models,
                 )
                 for item in pending_items
             ]

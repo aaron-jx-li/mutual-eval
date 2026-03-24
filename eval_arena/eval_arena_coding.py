@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         "--generation-max-tokens",
         type=int,
         default=None,
-        help="Maximum output tokens for generation requests.",
+        help="Maximum output tokens for generation requests. Omit or set to null in config to use no limit.",
     )
     parser.add_argument(
         "--reward-timeout",
@@ -177,7 +177,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume from an existing responses.jsonl in the output directory.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not hasattr(args, "model_max_tokens"):
+        args.model_max_tokens = None
+    return args
 
 
 def resolve_env_path() -> Path:
@@ -229,7 +232,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if args.generation_timeout is None:
         args.generation_timeout = int(section.get("generation_timeout", 120))
     if args.generation_max_tokens is None:
-        args.generation_max_tokens = int(section.get("generation_max_tokens", 4096))
+        cfg_val = section.get("generation_max_tokens")
+        args.generation_max_tokens = int(cfg_val) if cfg_val is not None else None
+    if not hasattr(args, "model_max_tokens") or args.model_max_tokens is None:
+        raw = section.get("model_max_tokens") or {}
+        args.model_max_tokens = {k: (int(v) if v is not None else None) for k, v in raw.items()}
     if args.reward_timeout is None:
         args.reward_timeout = int(section.get("reward_timeout", 300))
     if args.reward_max_concurrency is None:
@@ -517,7 +524,7 @@ def call_model(
     clients: dict[str, Any],
     prompt: str,
     *,
-    generation_max_tokens: int,
+    generation_max_tokens: int | None,
     use_litellm: bool = False,
     litellm_models: set[str] | None = None,
 ) -> str:
@@ -560,7 +567,7 @@ def call_model(
     if spec.provider == "anthropic":
         resp = clients["anthropic"].messages.create(
             model=spec.model_id,
-            max_tokens=generation_max_tokens,
+            max_tokens=generation_max_tokens or 8192,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(
@@ -733,7 +740,8 @@ def evaluate_item(
     reward_timeout: int,
     reward_semaphore: threading.Semaphore,
     completed_keys: set[str],
-    generation_max_tokens: int,
+    generation_max_tokens: int | None,
+    model_max_tokens: dict[str, int | None],
     use_litellm: bool,
     litellm_models: set[str] | None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -765,11 +773,12 @@ def evaluate_item(
         started = time.time()
         generation_started = time.time()
         try:
+            effective_max_tokens = model_max_tokens.get(model_spec.label, generation_max_tokens)
             response_text = call_model(
                 model_spec,
                 clients,
                 item["prompt"],
-                generation_max_tokens=generation_max_tokens,
+                generation_max_tokens=effective_max_tokens,
                 use_litellm=use_litellm,
                 litellm_models=litellm_models,
             )
@@ -837,8 +846,8 @@ def main() -> None:
         raise SystemExit("--reward-max-concurrency must be at least 1.")
     if args.first_k < 1:
         raise SystemExit("--first-k must be at least 1.")
-    if args.generation_max_tokens < 1:
-        raise SystemExit("--generation-max-tokens must be at least 1.")
+    if args.generation_max_tokens is not None and args.generation_max_tokens < 1:
+        raise SystemExit("--generation-max-tokens must be at least 1, or omit to use no limit.")
     if args.litellm_models is not None:
         invalid_litellm_models = sorted(set(args.litellm_models) - set(DEFAULT_MODELS))
         if invalid_litellm_models:
@@ -967,6 +976,7 @@ def main() -> None:
                 reward_semaphore=reward_semaphore,
                 completed_keys=completed_keys_snapshot,
                 generation_max_tokens=args.generation_max_tokens,
+                model_max_tokens=args.model_max_tokens,
                 use_litellm=args.use_litellm,
                 litellm_models=litellm_models,
             )
@@ -985,6 +995,7 @@ def main() -> None:
                     reward_semaphore=reward_semaphore,
                     completed_keys=completed_keys_snapshot,
                     generation_max_tokens=args.generation_max_tokens,
+                    model_max_tokens=args.model_max_tokens,
                     use_litellm=args.use_litellm,
                     litellm_models=litellm_models,
                 )

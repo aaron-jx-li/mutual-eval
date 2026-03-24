@@ -24,9 +24,9 @@ sampling:
   seed: 0
 
 evaluation:
-  input_file: results/arena_eval/coding_v0/arena_expert_5k_coding.jsonl
+  input_file: data/arena_expert_5k_coding.jsonl
   first_k: 500
-  output_dir: results/arena_eval/coding_v0
+  output_dir: results/arena_eval/coding_v1
   openai_base_url: https://api.openai.com/v1
   # Optional explicit direct OpenAI endpoint for GPT models.
   # Example: https://api.openai.com/v1 or https://us.api.openai.com/v1
@@ -48,14 +48,17 @@ evaluation:
   resume: true
   max_workers: 4
   generation_timeout: 120
-  generation_max_tokens: 8192
+  generation_max_tokens: 16384
+  model_max_tokens:
+    gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
+    gpt-5.1-mini: ~
   reward_timeout: 300
   reward_max_concurrency: 8
   rm_base_url: ${ARENA_RM_BASE_URL}
   rm_token: ${ARENA_RM_TOKEN}
   models:
     - gpt-5.4
-    - gpt-5-mini
+    - gpt-5.1-mini
     - gpt-4.1
     - gpt-4.1-mini
     - claude-opus-4-6
