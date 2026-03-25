@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 .DS_Store
+.claude/
 *.slurm
 *.err
 *.out
@@ -15,3 +16,4 @@ data/arena_140k.json
 data/arena_140k_math.json
 rm_test.py
 reward_client.py
+mutual_eval/
