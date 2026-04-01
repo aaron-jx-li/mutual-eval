@@ -18,27 +18,29 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | `new_question_calibration.py` | Exp 3: how few model responses are needed to estimate a new question's b_q and a_q? |
 | `sparsity_stratified.py` | Exp 4: level-stratified sampling — which difficulty levels are most informative? |
 | `label_noise.py` | Exp 5: label corruption — which corruptions most destabilize rankings? |
+| `add_hendrycks_metadata.py` | Exp 6 (stretch): extract Hendrycks MATH categories and add `category` column for category-stratified sampling |
+| `greedy_selection.py` | Exp 7: forward greedy question selection — finds minimal question set that recovers full-data rankings |
 | `run_experiments.py` | Top-level CLI orchestrator to run any or all experiments |
 | `results/` | CSV outputs and plots from each experiment |
 
 
 ## Expected Results
 
-| Model | Accuracy | 2PL | Pairwise IRT (Static) | 2PL+Pairwise IRT (Overall) |
-|---|---|---|---|---|
-| Deepseek-v3-0324              | 3  | 3  | 3  | 1  |
-| GPT-4.1-mini-2025-04-14       | 2  | 2  | 2  | 2  |
-| Mistral-medium-2505           | 4  | 4  | 4  | 3  |
-| Grok-3-mini-beta              | 1  | 1  | 1  | 4  |
-| Claude-3.5-haiku-20241022     | 5  | 5  | 5  | 5  |
-| GPT-4o-mini                   | 6  | 7  | 7  | 6  |
-| Llama-3.3-70b-it              | 8  | 6  | 6  | 7  |
-| Gemini-2.0-flash              | 7  | 8  | 8  | 8  |
-| Claude-3.7-sonnet-20250219    | 9  | 9  | 9  | 9  |
-| Gemma-3-27b-it                | 10 | 10 | 10 | 10 |
+| Model | Accuracy | 2PL | Pairwise IRT (Static) | Pairwise IRT (Open-ended) | 2PL+Pairwise IRT (Overall) |
+|---|---|---|---|---|---|
+| Deepseek-v3-0324              | 3  | 3  | 3  | 1  | 1  |
+| GPT-4.1-mini-2025-04-14       | 2  | 2  | 2  | 2  | 2  |
+| Mistral-medium-2505           | 4  | 4  | 4  | 3  | 3  |
+| Grok-3-mini-beta              | 1  | 1  | 1  | 5  | 4  |
+| Claude-3.5-haiku-20241022     | 5  | 5  | 5  | 8  | 5  |
+| GPT-4o-mini                   | 6  | 7  | 7  | 6  | 6  |
+| Llama-3.3-70b-it              | 8  | 6  | 6  | 9  | 7  |
+| Gemini-2.0-flash              | 7  | 8  | 8  | 10 | 8  |
+| Claude-3.7-sonnet-20250219    | 9  | 9  | 9  | 4  | 9  |
+| Gemma-3-27b-it                | 10 | 10 | 10 | 7  | 10 |
 
 - 2PL: Uses data in `data/static_10_models.csv` to generate rankings (500 questions, 10 models, 5000 rows - 1 row per question per model)
-- Pairwise IRT (Static): Uses data in `data/pairwise_results_900.csv` to generate rankings (892 questions, 10 models, 892 rows - 1 row per question)
+- Pairwise IRT (Open-ended): Uses data in `data/pairwise_results_900.csv` to generate rankings (892 questions, 10 models, 892 rows - 1 row per question)
 - 2PL+Pairwise IRT (Overall): Gives equal 0.50 weightage to both 2PL and Pairwise IRT to generate rankings
 
 
@@ -61,6 +63,12 @@ Tests whether the difficulty composition of the question set matters. Uses the p
 
 ### Exp 5 — Label Corruption
 Deliberately corrupts `judge_result` labels and measures ranking degradation. Tests both random flips (uniform noise) and targeted flips (easy-only, hard-only, or all responses for one model). The per-model inflation/deflation variants identify which models' positions are most sensitive to systematic annotation errors.
+
+### Exp 6 — Hendrycks Category Metadata *(stretch)*
+Tests whether category-stratified sampling (Algebra, Number Theory, Geometry, etc.) beats level-stratified sampling for a fixed question budget. First checks whether Hendrycks MATH categories can be recovered from `question_id` structure or by matching question text against the public Hendrycks MATH dataset. If feasible, adds a `category` column via `add_hendrycks_metadata.py` and reruns Exp 4-style stratification schemes by category instead of level.
+
+### Exp 7 — Greedy Question Selection
+Forward greedy search for the minimal question set that recovers the full-data model ranking. Starting from one random question, iteratively adds the question whose inclusion maximizes Kendall's τ against the full-data reference ranking. Terminates when τ > 0.95 for 3 consecutive steps or a hard cap is reached (150 for 2PL, 200 for pairwise IRT). Produces a τ-vs-question-count curve that serves as a lower bound on the question budget required for reliable rankings, directly comparable to the Exp 1 random baseline. The level distribution of greedily selected questions also informs which difficulty levels are most informative (connecting to Exp 4).
 
 
 ## How to Run
@@ -86,6 +94,12 @@ python robustness/sparsity_stratified.py --static-csv data/static_10_models.csv
 
 # 5. Label corruption
 python robustness/label_noise.py --static-csv data/static_10_models.csv
+
+# 6. Hendrycks category metadata (stretch — check feasibility first)
+python robustness/add_hendrycks_metadata.py --static-csv data/static_10_models.csv
+
+# 7. Greedy question selection
+python robustness/greedy_selection.py --static-csv data/static_10_models.csv --hard-cap 150
 
 # All results are written to robustness/results/
 ```
