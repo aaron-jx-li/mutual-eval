@@ -22,6 +22,26 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | `results/` | CSV outputs and plots from each experiment |
 
 
+## Expected Results
+
+| Model | Accuracy | 2PL | Pairwise IRT (Static) | 2PL+Pairwise IRT (Overall) |
+|---|---|---|---|---|
+| Deepseek-v3-0324              | 3  | 3  | 3  | 1  |
+| GPT-4.1-mini-2025-04-14       | 2  | 2  | 2  | 2  |
+| Mistral-medium-2505           | 4  | 4  | 4  | 3  |
+| Grok-3-mini-beta              | 1  | 1  | 1  | 4  |
+| Claude-3.5-haiku-20241022     | 5  | 5  | 5  | 5  |
+| GPT-4o-mini                   | 6  | 7  | 7  | 6  |
+| Llama-3.3-70b-it              | 8  | 6  | 6  | 7  |
+| Gemini-2.0-flash              | 7  | 8  | 8  | 8  |
+| Claude-3.7-sonnet-20250219    | 9  | 9  | 9  | 9  |
+| Gemma-3-27b-it                | 10 | 10 | 10 | 10 |
+
+- 2PL: Uses data in `data/static_10_models.csv` to generate rankings (500 questions, 10 models, 5000 rows - 1 row per question per model)
+- Pairwise IRT (Static): Uses data in `data/pairwise_results_900.csv` to generate rankings (892 questions, 10 models, 892 rows - 1 row per question)
+- 2PL+Pairwise IRT (Overall): Gives equal 0.50 weightage to both 2PL and Pairwise IRT to generate rankings
+
+
 ## Experiments
 
 ### Exp 0 — Seed Stability
