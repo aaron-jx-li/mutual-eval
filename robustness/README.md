@@ -19,7 +19,7 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | `sparsity_stratified.py` | Exp 4: level-stratified sampling — which difficulty levels are most informative? |
 | `label_noise.py` | Exp 5: label corruption — which corruptions most destabilize rankings? |
 | `add_hendrycks_metadata.py` | Exp 6 (stretch): extract Hendrycks MATH categories and add `category` column for category-stratified sampling |
-| `greedy_selection.py` | Exp 7: forward greedy question selection — finds minimal question set that recovers full-data rankings |
+| `greedy_selection.py` | Exp 7 & 8: greedy question selection — `--strategy random` (Exp 7) or `--strategy diverse` (Exp 8) |
 | `run_experiments.py` | Top-level CLI orchestrator to run any or all experiments |
 | `results/` | CSV outputs and plots from each experiment |
 
@@ -35,8 +35,8 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | Claude-3.5-haiku-20241022     | 5  | 5  | 5  | 8  | 5  |
 | GPT-4o-mini                   | 6  | 7  | 7  | 6  | 6  |
 | Llama-3.3-70b-it              | 8  | 6  | 6  | 9  | 7  |
-| Gemini-2.0-flash              | 7  | 8  | 8  | 10 | 8  |
-| Claude-3.7-sonnet-20250219    | 9  | 9  | 9  | 4  | 9  |
+| Gemini-2.0-flash              | 7  | 8  | 8  | 10 | 9  |
+| Claude-3.7-sonnet-20250219    | 9  | 9  | 9  | 4  | 8  |
 | Gemma-3-27b-it                | 10 | 10 | 10 | 7  | 10 |
 
 - 2PL: Uses data in `data/static_10_models.csv` to generate rankings (500 questions, 10 models, 5000 rows - 1 row per question per model)
@@ -67,8 +67,11 @@ Deliberately corrupts `judge_result` labels and measures ranking degradation. Te
 ### Exp 6 — Hendrycks Category Metadata *(stretch)*
 Tests whether category-stratified sampling (Algebra, Number Theory, Geometry, etc.) beats level-stratified sampling for a fixed question budget. First checks whether Hendrycks MATH categories can be recovered from `question_id` structure or by matching question text against the public Hendrycks MATH dataset. If feasible, adds a `category` column via `add_hendrycks_metadata.py` and reruns Exp 4-style stratification schemes by category instead of level.
 
-### Exp 7 — Greedy Question Selection
-Forward greedy search for the minimal question set that recovers the full-data model ranking. Starting from one random question, iteratively adds the question whose inclusion maximizes Kendall's τ against the full-data reference ranking. Terminates when τ > 0.95 for 3 consecutive steps or a hard cap is reached (150 for 2PL, 200 for pairwise IRT). Produces a τ-vs-question-count curve that serves as a lower bound on the question budget required for reliable rankings, directly comparable to the Exp 1 random baseline. The level distribution of greedily selected questions also informs which difficulty levels are most informative (connecting to Exp 4).
+### Exp 7 — Greedy Question Selection with Candidate Subsampling
+Forward greedy search for a minimal question set that recovers the full-data model ranking. At each step, randomly samples m=50 candidate questions and selects the one whose addition maximizes Kendall's τ against the full-data reference ranking. Subsampling caps compute at exactly 50 IRT fits/step (vs. up to ~450 for full greedy), reducing runtime ~9x while preserving the one-at-a-time greedy property. Run with 3 seeds to verify stability. Terminates when τ > 0.95 for 3 consecutive steps or hard cap is reached (150 for 2PL, 200 for pairwise IRT). The level distribution of selected questions connects to Exp 4 findings.
+
+### Exp 8 — Diversity-Batched Greedy Question Selection
+Improves on Exp 7 by adding questions in level-diverse batches. At each step, constructs `n_batches=10` candidate batches by sampling one question from each difficulty level group (GSM-8k + Levels 1–5), evaluates all 10 batches via IRT, and adds the best batch (~6 questions). Enforces difficulty diversity by construction rather than hoping for it via random sampling. Primary comparison against Exp 7: does level diversity accelerate convergence to τ > 0.95, and does it do so with fewer total IRT fits? All three methods (Exp 1 random, Exp 7, Exp 8) are plotted on the same τ-vs-questions-added axes.
 
 
 ## How to Run
@@ -98,8 +101,11 @@ python robustness/label_noise.py --static-csv data/static_10_models.csv
 # 6. Hendrycks category metadata (stretch — check feasibility first)
 python robustness/add_hendrycks_metadata.py --static-csv data/static_10_models.csv
 
-# 7. Greedy question selection
-python robustness/greedy_selection.py --static-csv data/static_10_models.csv --hard-cap 150
+# 7. Greedy question selection (candidate subsampling, m=50)
+python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy random --hard-cap 150 --candidates 50 --seeds 0 1 2
+
+# 8. Diversity-batched greedy question selection
+python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy diverse --hard-cap 150 --n-batches 10 --seeds 0 1 2
 
 # All results are written to robustness/results/
 ```

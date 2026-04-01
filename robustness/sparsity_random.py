@@ -78,8 +78,8 @@ _BOTH_REF = {
     "claude-3-5-haiku-20241022":  5,
     "gpt-4o-mini":                6,
     "llama-3.3-70b-it":           7,
-    "gemini-2.0-flash":           8,
-    "claude-3-7-sonnet-20250219": 9,
+    "claude-3-7-sonnet-20250219": 8,
+    "gemini-2.0-flash":           9,
     "gemma-3-27b-it":             10,
 }
 
@@ -277,11 +277,11 @@ def run(
             # --- fit IRT ---
             fit_kw = dict(num_epochs=num_epochs, verbose=not quiet)
             if mode == "static":
-                mp, _ = fit_static_irt(sparse_static, **fit_kw)
+                mp, _ = fit_static_irt(sparse_static, lr=0.05, **fit_kw)
             elif mode == "arena":
-                mp, _ = fit_arena_irt(sparse_arena, **fit_kw)
+                mp, _ = fit_arena_irt(sparse_arena, lr=0.05, **fit_kw)
             else:  # both
-                mp, _ = fit_joint_irt(sparse_static, sparse_arena, **fit_kw)
+                mp, _ = fit_joint_irt(sparse_static, sparse_arena, lr=0.05, **fit_kw)
 
             # --- compute metrics ---
             metrics = compute_all_metrics(mp, mode)
