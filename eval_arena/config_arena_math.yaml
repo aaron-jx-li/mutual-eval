@@ -7,10 +7,8 @@ evaluation:
   input_file: data/arena_math_900.json
   output_dir: results/arena_eval/math_v1
   use_litellm: false
-  litellm_models:
-    - claude-opus-4-6
-    - claude-sonnet-4-6
-    - claude-haiku-4-5
+  litellm_models: []
+  generation_max_tokens: 32768
   save_every: 50
   resume: true
   retry_statuses:

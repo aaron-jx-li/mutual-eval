@@ -528,6 +528,14 @@ def call_model(
     use_litellm: bool = False,
     litellm_models: set[str] | None = None,
 ) -> str:
+    # Gemini 2.5/3.1 are thinking models: they consume tokens for internal reasoning
+    # before producing output, so the shared generation_max_tokens budget is insufficient.
+    _GOOGLE_THINKING_PREFIXES = ("2.5", "3.1")
+    google_max_tokens = (
+        65536
+        if any(p in spec.model_id for p in _GOOGLE_THINKING_PREFIXES)
+        else generation_max_tokens
+    )
     if should_route_via_litellm(
         spec,
         use_litellm=use_litellm,
@@ -554,7 +562,7 @@ def call_model(
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=generation_max_tokens,
+            max_tokens=google_max_tokens,
         )
     if spec.provider == "openrouter":
         return call_openai_compatible(
