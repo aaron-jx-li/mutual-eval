@@ -361,13 +361,18 @@ def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) ->
 
 def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False) -> str:
     spec = MODEL_LOOKUP[model_label]
+    # 4096 tokens is insufficient for hard coding problems: long solutions get truncated,
+    # and thinking models exhaust the budget before producing any output.
+    # Gemini 2.5 thinking models need extra headroom for internal reasoning chains.
+    _GOOGLE_THINKING_PREFIXES = ("2.5", "3.1")
+    google_max_tokens = 65536 if any(p in spec.model_id for p in _GOOGLE_THINKING_PREFIXES) else 16384
     if should_use_litellm_for_model(spec, use_litellm=use_litellm):
         return call_openai_compatible(
             clients["litellm"],
             get_routed_model_id(spec, use_litellm=True),
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=16384,
         )
     if spec.provider == "openai":
         return call_openai_compatible(
@@ -375,7 +380,7 @@ def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_li
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=16384,
         )
     if spec.provider == "google":
         return call_openai_compatible(
@@ -383,7 +388,7 @@ def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_li
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=google_max_tokens,
         )
     if spec.provider == "openrouter":
         return call_openai_compatible(
@@ -391,12 +396,12 @@ def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_li
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=16384,
         )
     if spec.provider == "anthropic":
         resp = clients["anthropic"].messages.create(
             model=spec.model_id,
-            max_tokens=4096,
+            max_tokens=16384,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(

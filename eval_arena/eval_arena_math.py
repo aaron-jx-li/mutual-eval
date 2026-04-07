@@ -109,6 +109,13 @@ def parse_args() -> argparse.Namespace:
         help="Provider API timeout seconds for generation requests.",
     )
     parser.add_argument(
+        "--generation-max-tokens",
+        type=int,
+        default=None,
+        dest="generation_max_tokens",
+        help="Maximum tokens for generation (default from config: 32768).",
+    )
+    parser.add_argument(
         "--reward-timeout",
         type=int,
         default=None,
@@ -217,6 +224,9 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.retry_statuses = list(section.get("retry_statuses", ["generation_error"]))
     if args.max_rows is None and section.get("max_rows") is not None:
         args.max_rows = int(section.get("max_rows"))
+    if args.generation_max_tokens is None:
+        args.generation_max_tokens = int(section.get("generation_max_tokens", 32768))
+    args.model_max_tokens = {k: (int(v) if v is not None else None) for k, v in section.get("model_max_tokens", {}).items()}
     return args
 
 
@@ -392,14 +402,21 @@ def build_clients_with_mode(
     return clients
 
 
-def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False, litellm_models: set[str] | None = None) -> str:
+def call_model(spec, clients: dict[str, Any], prompt: str, *, generation_max_tokens: int | None, use_litellm: bool = False, litellm_models: set[str] | None = None) -> str:
+    # Gemini 2.5/3.1 are thinking models that consume tokens for internal reasoning
+    _GOOGLE_THINKING_PREFIXES = ("2.5", "3.1")
+    google_max_tokens = (
+        65536
+        if any(p in spec.model_id for p in _GOOGLE_THINKING_PREFIXES)
+        else generation_max_tokens
+    )
     if _should_use_litellm(spec, use_litellm=use_litellm, litellm_models=litellm_models):
         return call_openai_compatible(
             clients["litellm"],
             get_routed_model_id(spec, use_litellm=True),
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "openai":
         return call_openai_compatible(
@@ -407,7 +424,7 @@ def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool 
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
         return call_openai_compatible(
@@ -415,7 +432,7 @@ def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool 
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=google_max_tokens,
         )
     if spec.provider == "openrouter":
         return call_openai_compatible(
@@ -423,12 +440,12 @@ def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool 
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "anthropic":
         resp = clients["anthropic"].messages.create(
             model=spec.model_id,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens or 8192,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(
@@ -610,6 +627,8 @@ def evaluate_item(
     completed_keys: set[str],
     use_litellm: bool,
     litellm_models: set[str] | None = None,
+    generation_max_tokens: int | None = None,
+    model_max_tokens: dict[str, int | None] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     item_results: list[tuple[str, dict[str, Any]]] = []
 
@@ -639,7 +658,8 @@ def evaluate_item(
         started = time.time()
         generation_started = time.time()
         try:
-            response_text = call_model(model_spec, clients, item["prompt"], use_litellm=use_litellm, litellm_models=litellm_models)
+            effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
+            response_text = call_model(model_spec, clients, item["prompt"], generation_max_tokens=effective_max_tokens, use_litellm=use_litellm, litellm_models=litellm_models)
             record["generation_latency_s"] = round(time.time() - generation_started, 2)
             if not response_text.strip():
                 raise ValueError("Empty response text")
@@ -813,6 +833,8 @@ def main() -> None:
                 completed_keys=completed_keys_snapshot,
                 use_litellm=args.use_litellm,
                 litellm_models=litellm_models,
+                generation_max_tokens=args.generation_max_tokens,
+                model_max_tokens=args.model_max_tokens,
             )
             for eval_key, record in item_results:
                 record_result(eval_key, record)
@@ -830,6 +852,8 @@ def main() -> None:
                     completed_keys=completed_keys_snapshot,
                     use_litellm=args.use_litellm,
                     litellm_models=litellm_models,
+                    generation_max_tokens=args.generation_max_tokens,
+                    model_max_tokens=args.model_max_tokens,
                 )
                 for item in pending_items
             ]
