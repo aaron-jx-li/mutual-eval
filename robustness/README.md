@@ -24,7 +24,28 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | `results/` | CSV outputs and plots from each experiment |
 
 
-## Expected Results
+## Expected Results -- New Data with Reward Model
+
+| Model | Static (Math) | Static (Coding) | Arena (Math) | Arena (Coding) | Arena (Generic) | Both (Math) | Both (Coding) | Both (Static) | Both (Arena) | All (Static + Arena) |
+|---|---|---|---|---|---|---|---|
+| claude-opus-4-6               | 1  | 2  | 3  | 2  | 1  | 1  | 1  | 1  | 1  | 1  |
+| claude-sonnet-4-6             | 2  | 1  | 6  | 4  | 5  | 2  | 2  | 2  | 4  | 2  |
+| gpt-5.4                       | 3  | 5  | 4  | 1  | 7  | 3  | 3  | 3  | 3  | 3  |
+| deepseek-v3.2                 | 4  | 12 | 5  | 10 | 8  | 4  | 12 | 7  | 9  | 6  |
+| qwen3-max-thinking            | 5  | 7  | 1  | 7  | 9  | 5  | 6  | 4  | 8  | 4  |
+| grok-4                        | 6  | 14 | 12 | 6  | 2  | 6  | 13 | 6  | 6  | 5  |
+| gpt-4.1-mini                  | 7  | 6  | 7  | 11 | 12 | 7  | 10 | 5  | 12 | 8  |
+| claude-haiku-4-5              | 8  | 10 | 10 | 9  | 13 | 8  | 8  | 8  | 13 | 7  |
+| gpt-4.1                       | 10 | 9  | 8  | 13 | 11 | 9  | 11 | 10 | 11 | 10 |
+| mistral-large-3               | 11 | 13 | 13 | 12 | 3  | 10 | 14 | 12 | 7  | 9  |
+| gpt-5-mini                    | 9  | 4  | 15 | 14 | 14 | 11 | 9  | 9  | 14 | 11 |
+| llama-4-maverick-instruct     | 12 | 15 | 14 | 15 | 15 | 12 | 15 | 11 | 15 | 12 |
+| gemini-3.1-pro                | 13 | 8  | 2  | 3  | 4  | 13 | 4  | 13 | 2  | 13 |
+| gemini-2.5-pro                | 15 | 11 | 9  | 5  | 6  | 14 | 5  | 15 | 5  | 14 |
+| gemini-2.5-flash              | 14 | 3  | 11 | 8  | 10 | 15 | 7  | 14 | 10 | 15 |
+
+
+## Expected Results -- OLD
 
 | Model | Accuracy | 2PL | Pairwise IRT (Static) | Pairwise IRT (Open-ended) | 2PL+Pairwise IRT (Overall) |
 |---|---|---|---|---|---|
