@@ -6,19 +6,32 @@ the resulting model ranking against the hardcoded expected rankings from
 robustness/README.md.
 
 Supported modes:
-  static  — subsample from data/static_10_models.csv, compare vs. 2PL ranking
-  arena   — subsample from data/pairwise_results_900.csv, compare vs. Pairwise IRT ranking
-  both    — subsample from both simultaneously, run fit_joint_irt, compare vs.
-             2PL+Pairwise IRT (Overall) ranking
+  static      — subsample from a static JSONL (or CSV), compare vs. static reference
+  arena       — subsample from data/pairwise_results_900.csv, compare vs. Pairwise IRT ranking
+  both        — subsample from both simultaneously, run fit_joint_irt, compare vs.
+                2PL+Pairwise IRT (Overall) ranking
+  reward      — subsample from an arena reward JSONL, compare vs. reward reference
+  both-reward — subsample from static JSONL + arena reward JSONL simultaneously,
+                run fit_joint_reward_irt, compare vs. joint reference
 
 Usage:
     python robustness/sparsity_random.py \\
         --mode static \\
+        --static-jsonl data/new/static_math_v0.jsonl \\
         --fractions 0.05 0.1 0.2 0.3 0.5 0.7 \\
         --seeds 0 1 2 3 4
 
-    python robustness/sparsity_random.py --mode arena --fractions 0.25 0.5 0.75
-    python robustness/sparsity_random.py --mode both  --fractions 0.1 0.25 0.5
+    python robustness/sparsity_random.py --mode reward \\
+        --arena-jsonl data/new/arena_math_v0.jsonl --fractions 0.25 0.5 0.75
+
+    python robustness/sparsity_random.py --mode both-reward \\
+        --static-jsonl data/new/static_math_v0.jsonl \\
+        --arena-jsonl data/new/arena_math_v0.jsonl --fractions 0.1 0.25 0.5
+
+    # Old CSV-based modes still work:
+    python robustness/sparsity_random.py --mode arena --arena-csv data/pairwise_results_900.csv
+    python robustness/sparsity_random.py --mode both  --static-csv data/static_10_models.csv \\
+        --arena-csv data/pairwise_results_900.csv --fractions 0.1 0.25 0.5
 """
 
 from __future__ import annotations
@@ -32,62 +45,25 @@ from datetime import datetime
 from scipy.stats import spearmanr, kendalltau
 
 from robustness.common_cli import base_parser
-from robustness.data_utils import load_static, load_arena, subsample_questions
-from ranking import fit_static_irt, fit_arena_irt, fit_joint_irt
+from robustness.data_utils import (
+    load_static, load_static_jsonl, load_arena, load_arena_reward,
+    subsample_questions,
+)
+from robustness.reference_rankings import REFERENCE_RANKINGS, JOINT_REFERENCE_RANKINGS
+from ranking import fit_static_irt, fit_arena_irt, fit_joint_irt, fit_reward_irt, fit_joint_reward_irt
 
 
-# ---------------------------------------------------------------------------
-# Hardcoded reference rankings from robustness/README.md Expected Results
-# Keys are lowercase model names matching the actual CSV values.
-# ---------------------------------------------------------------------------
+def _file_stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
 
-# 2PL column (static dataset)
-_STATIC_REF = {
-    "grok-3-mini-beta":           1,
-    "gpt-4.1-mini-2025-04-14":    2,
-    "deepseek-v3-0324":           3,
-    "mistral-medium-2505":        4,
-    "claude-3-5-haiku-20241022":  5,
-    "llama-3.3-70b-it":           6,
-    "gpt-4o-mini":                7,
-    "gemini-2.0-flash":           8,
-    "claude-3-7-sonnet-20250219": 9,
-    "gemma-3-27b-it":             10,
-}
 
-# Pairwise IRT (Static) column — same ordering as 2PL
-_ARENA_REF = {
-    "deepseek-v3-0324":           1,
-    "gpt-4.1-mini-2025-04-14":    2,
-    "mistral-medium-2505":        3,
-    "claude-3-7-sonnet-20250219": 4,
-    "grok-3-mini-beta":           5,
-    "gpt-4o-mini":                6,
-    "gemma-3-27b-it":             7,
-    "claude-3-5-haiku-20241022":  8,
-    "llama-3.3-70b-it":           9,
-    "gemini-2.0-flash":           10,
-}
-
-# 2PL+Pairwise IRT (Overall) column
-_BOTH_REF = {
-    "deepseek-v3-0324":           1,
-    "gpt-4.1-mini-2025-04-14":    2,
-    "mistral-medium-2505":        3,
-    "grok-3-mini-beta":           4,
-    "claude-3-5-haiku-20241022":  5,
-    "gpt-4o-mini":                6,
-    "llama-3.3-70b-it":           7,
-    "claude-3-7-sonnet-20250219": 8,
-    "gemini-2.0-flash":           9,
-    "gemma-3-27b-it":             10,
-}
-
-REFERENCE_RANKINGS: dict[str, dict[str, int]] = {
-    "static": _STATIC_REF,
-    "arena":  _ARENA_REF,
-    "both":   _BOTH_REF,
-}
+def _dataset_label(mode: str, static_csv: str | None, static_jsonl: str, arena_jsonl: str) -> str:
+    """Extract human-readable dataset label (math/coding/generic/all) for folder naming."""
+    if mode in ("arena", "both") or (mode == "static" and static_csv):
+        return ""  # old CSV modes — no domain label
+    stem = _file_stem(static_jsonl if mode in ("static", "both-reward") else arena_jsonl)
+    parts = stem.split("_")
+    return parts[1] if len(parts) >= 2 else ""
 
 
 def _model_key(name: str) -> str:
@@ -98,25 +74,22 @@ def _model_key(name: str) -> str:
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_all_metrics(model_params: pd.DataFrame, mode: str) -> dict:
+def compute_all_metrics(model_params: pd.DataFrame, ref_dict: dict[str, int]) -> dict:
     """
-    Compare IRT-generated model ranking against the hardcoded reference for `mode`.
+    Compare IRT-generated model ranking against the provided reference dict.
 
     Parameters
     ----------
     model_params : pd.DataFrame
         Output of fit_*_irt — must have columns [model_name, theta], already
         sorted by theta descending (rank 1 = highest theta).
-    mode : str
-        One of "static", "arena", "both".
+    ref_dict : dict[str, int]
+        Map of lowercase model name → reference rank (1 = best).
 
     Returns
     -------
     dict with keys: spearman_rho, kendall_tau, top3_acc, top5_acc, exact_matches
     """
-    ref = REFERENCE_RANKINGS[mode]
-
-    # Build aligned lists of (pred_rank, ref_rank) for models present in both
     mp = model_params.copy().reset_index(drop=True)
     mp["pred_rank"] = range(1, len(mp) + 1)
     mp["model_key"] = mp["model_name"].map(_model_key)
@@ -124,8 +97,8 @@ def compute_all_metrics(model_params: pd.DataFrame, mode: str) -> dict:
     aligned = []
     for _, row in mp.iterrows():
         key = row["model_key"]
-        if key in ref:
-            aligned.append((int(row["pred_rank"]), ref[key]))
+        if key in ref_dict:
+            aligned.append((int(row["pred_rank"]), ref_dict[key]))
 
     if len(aligned) < 2:
         return dict(spearman_rho=float("nan"), kendall_tau=float("nan"),
@@ -135,18 +108,16 @@ def compute_all_metrics(model_params: pd.DataFrame, mode: str) -> dict:
     pred_ranks = [a[0] for a in aligned]
     ref_ranks  = [a[1] for a in aligned]
 
-    rho, _  = spearmanr(pred_ranks, ref_ranks)
-    tau, _  = kendalltau(pred_ranks, ref_ranks)
+    rho, _ = spearmanr(pred_ranks, ref_ranks)
+    tau, _ = kendalltau(pred_ranks, ref_ranks)
 
-    # Top-k accuracy: fraction of top-k predicted that appear in top-k reference
-    ref_top3 = {m for m, r in ref.items() if r <= 3}
-    ref_top5 = {m for m, r in ref.items() if r <= 5}
+    ref_top3 = {m for m, r in ref_dict.items() if r <= 3}
+    ref_top5 = {m for m, r in ref_dict.items() if r <= 5}
     pred_top3 = set(mp[mp["pred_rank"] <= 3]["model_key"].tolist())
     pred_top5 = set(mp[mp["pred_rank"] <= 5]["model_key"].tolist())
 
     top3_acc = len(pred_top3 & ref_top3) / 3.0
     top5_acc = len(pred_top5 & ref_top5) / 5.0
-
     exact_matches = sum(p == r for p, r in aligned)
 
     return dict(
@@ -174,9 +145,11 @@ def _subsample_arena_questions(arena_df: pd.DataFrame, frac: float, seed: int) -
 def save_fraction_results(
     frac: float,
     mode: str,
-    seed_rows: list[dict],          # one dict per seed
+    dataset: str,
+    seed_rows: list[dict],
     last_sparse_static: pd.DataFrame | None,
     last_sparse_arena: pd.DataFrame | None,
+    last_sparse_reward: pd.DataFrame | None,
     last_model_params: pd.DataFrame,
     out_dir: str,
     timestamp: str,
@@ -184,15 +157,17 @@ def save_fraction_results(
     """
     Write per-fraction output to a timestamped folder.
 
-    Folder: {out_dir}/random/{mode}_f{frac:.2f}_{timestamp}/
+    Folder: {out_dir}/random/{mode}_{dataset}_{timestamp}/f{frac:.2f}/
     Files:
       sampled_questions.csv   — question_ids sampled (last seed)
       ranking.csv             — model ranking from last seed
       metrics.csv             — per-seed metrics + aggregate row
     """
+    prefix = f"{mode}_{dataset}" if dataset else mode
     folder = os.path.join(
         out_dir, "random",
-        f"{mode}_f{frac:.2f}_{timestamp}",
+        f"{prefix}_{timestamp}",
+        f"f{frac:.2f}",
     )
     os.makedirs(folder, exist_ok=True)
 
@@ -200,6 +175,8 @@ def save_fraction_results(
     if last_sparse_static is not None:
         cols = ["question_id"] + (["level"] if "level" in last_sparse_static.columns else [])
         q_df = last_sparse_static[cols].drop_duplicates("question_id").reset_index(drop=True)
+    elif last_sparse_reward is not None:
+        q_df = pd.DataFrame({"question_id": last_sparse_reward["question_id"].unique()})
     elif last_sparse_arena is not None:
         q_df = pd.DataFrame({"question_id": last_sparse_arena["question_id"].unique()})
     else:
@@ -231,8 +208,10 @@ def run(
     mode: str = "static",
     fractions: list[float] | None = None,
     seeds: list[int] | None = None,
-    static_csv: str = "data/static_10_models.csv",
-    arena_csv: str = "data/pairwise_results_900.csv",
+    static_csv: str | None = None,
+    arena_csv: str | None = None,
+    static_jsonl: str = "data/new/static_math_v0.jsonl",
+    arena_jsonl: str = "data/new/arena_math_v0.jsonl",
     out_dir: str = "robustness/results",
     num_epochs: int = 2000,
     quiet: bool = True,
@@ -249,8 +228,37 @@ def run(
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    static_df = load_static(static_csv) if mode in ("static", "both") else None
-    arena_df  = load_arena(arena_csv)   if mode in ("arena",  "both") else None
+    # --- Load data ---
+    static_df = arena_df = reward_df = None
+
+    if mode in ("static", "both", "both-reward"):
+        if static_csv:
+            static_df = load_static(static_csv)
+        else:
+            static_df = load_static_jsonl(static_jsonl)
+
+    if mode in ("arena", "both"):
+        arena_df = load_arena(arena_csv)
+
+    if mode in ("reward", "both-reward"):
+        reward_df = load_arena_reward(arena_jsonl)
+
+    # --- Dataset label for folder naming ---
+    dataset = _dataset_label(mode, static_csv, static_jsonl, arena_jsonl)
+
+    # --- Select reference ranking dict ---
+    if mode == "both-reward":
+        s_key = _file_stem(static_jsonl)
+        a_key = _file_stem(arena_jsonl)
+        ref_dict = JOINT_REFERENCE_RANKINGS[(s_key, a_key)]
+    elif mode == "arena":
+        ref_dict = REFERENCE_RANKINGS["arena"]
+    elif mode == "both":
+        ref_dict = REFERENCE_RANKINGS["both"]
+    elif mode == "static":
+        ref_dict = REFERENCE_RANKINGS["static"] if static_csv else REFERENCE_RANKINGS[_file_stem(static_jsonl)]
+    else:  # reward
+        ref_dict = REFERENCE_RANKINGS[_file_stem(arena_jsonl)]
 
     all_rows: list[dict] = []
 
@@ -259,20 +267,24 @@ def run(
         seed_rows: list[dict] = []
         last_sparse_static = None
         last_sparse_arena  = None
+        last_sparse_reward = None
         last_model_params  = None
 
         for seed in seeds:
             print(f"  seed={seed}", end="  ", flush=True)
 
-            # --- sample questions ---
             sparse_static = None
             sparse_arena  = None
+            sparse_reward = None
 
-            if mode in ("static", "both"):
+            if mode in ("static", "both", "both-reward"):
                 sparse_static = subsample_questions(static_df, frac, seed)
 
             if mode in ("arena", "both"):
                 sparse_arena = _subsample_arena_questions(arena_df, frac, seed)
+
+            if mode in ("reward", "both-reward"):
+                sparse_reward = subsample_questions(reward_df, frac, seed)
 
             # --- fit IRT ---
             fit_kw = dict(num_epochs=num_epochs, verbose=not quiet)
@@ -280,11 +292,15 @@ def run(
                 mp, _ = fit_static_irt(sparse_static, lr=0.05, **fit_kw)
             elif mode == "arena":
                 mp, _ = fit_arena_irt(sparse_arena, lr=0.05, **fit_kw)
-            else:  # both
+            elif mode == "both":
                 mp, _ = fit_joint_irt(sparse_static, sparse_arena, lr=0.05, **fit_kw)
+            elif mode == "reward":
+                mp, _ = fit_reward_irt(sparse_reward, lr=0.05, **fit_kw)
+            else:  # both-reward
+                mp, _ = fit_joint_reward_irt(sparse_static, sparse_reward, lr=0.02, **fit_kw)
 
             # --- compute metrics ---
-            metrics = compute_all_metrics(mp, mode)
+            metrics = compute_all_metrics(mp, ref_dict)
             print(f"ρ={metrics['spearman_rho']:.3f}  τ={metrics['kendall_tau']:.3f}  "
                   f"top3={metrics['top3_acc']:.2f}  top5={metrics['top5_acc']:.2f}  "
                   f"exact={metrics['exact_matches']}")
@@ -295,15 +311,18 @@ def run(
 
             last_sparse_static = sparse_static
             last_sparse_arena  = sparse_arena
+            last_sparse_reward = sparse_reward
             last_model_params  = mp
 
         # --- save per-fraction results ---
         save_fraction_results(
             frac=frac,
             mode=mode,
+            dataset=dataset,
             seed_rows=seed_rows,
             last_sparse_static=last_sparse_static,
             last_sparse_arena=last_sparse_arena,
+            last_sparse_reward=last_sparse_reward,
             last_model_params=last_model_params,
             out_dir=out_dir,
             timestamp=timestamp,
@@ -328,7 +347,7 @@ def run(
 
 def main() -> None:
     p = base_parser("Exp 1: Random question subsampling")
-    p.add_argument("--mode", choices=["static", "arena", "both"], default="static", help="Which dataset(s) to sample from")
+    p.add_argument("--mode", choices=["static", "arena", "both", "reward", "both-reward"], default="static", help="Which dataset(s) to sample from")
     p.add_argument("--fractions", type=float, nargs="+", default=[0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0], help="Fractions of questions to retain")
     args = p.parse_args()
 
@@ -338,6 +357,8 @@ def main() -> None:
         seeds=args.seeds,
         static_csv=args.static_csv,
         arena_csv=args.arena_csv,
+        static_jsonl=args.static_jsonl,
+        arena_jsonl=args.arena_jsonl,
         out_dir=args.out_dir,
         num_epochs=args.num_epochs,
         quiet=args.quiet,
