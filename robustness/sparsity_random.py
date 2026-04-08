@@ -42,13 +42,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 from datetime import datetime
-from scipy.stats import spearmanr, kendalltau
 
 from robustness.common_cli import base_parser
 from robustness.data_utils import (
     load_static, load_static_jsonl, load_arena, load_arena_reward,
     subsample_questions,
 )
+from robustness.metrics import compute_all_metrics
 from robustness.reference_rankings import REFERENCE_RANKINGS, JOINT_REFERENCE_RANKINGS
 from ranking import fit_static_irt, fit_arena_irt, fit_joint_irt, fit_reward_irt, fit_joint_reward_irt
 
@@ -64,69 +64,6 @@ def _dataset_label(mode: str, static_csv: str | None, static_jsonl: str, arena_j
     stem = _file_stem(static_jsonl if mode in ("static", "both-reward") else arena_jsonl)
     parts = stem.split("_")
     return parts[1] if len(parts) >= 2 else ""
-
-
-def _model_key(name: str) -> str:
-    return name.strip().lower()
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def compute_all_metrics(model_params: pd.DataFrame, ref_dict: dict[str, int]) -> dict:
-    """
-    Compare IRT-generated model ranking against the provided reference dict.
-
-    Parameters
-    ----------
-    model_params : pd.DataFrame
-        Output of fit_*_irt — must have columns [model_name, theta], already
-        sorted by theta descending (rank 1 = highest theta).
-    ref_dict : dict[str, int]
-        Map of lowercase model name → reference rank (1 = best).
-
-    Returns
-    -------
-    dict with keys: spearman_rho, kendall_tau, top3_acc, top5_acc, exact_matches
-    """
-    mp = model_params.copy().reset_index(drop=True)
-    mp["pred_rank"] = range(1, len(mp) + 1)
-    mp["model_key"] = mp["model_name"].map(_model_key)
-
-    aligned = []
-    for _, row in mp.iterrows():
-        key = row["model_key"]
-        if key in ref_dict:
-            aligned.append((int(row["pred_rank"]), ref_dict[key]))
-
-    if len(aligned) < 2:
-        return dict(spearman_rho=float("nan"), kendall_tau=float("nan"),
-                    top3_acc=float("nan"), top5_acc=float("nan"),
-                    exact_matches=0)
-
-    pred_ranks = [a[0] for a in aligned]
-    ref_ranks  = [a[1] for a in aligned]
-
-    rho, _ = spearmanr(pred_ranks, ref_ranks)
-    tau, _ = kendalltau(pred_ranks, ref_ranks)
-
-    ref_top3 = {m for m, r in ref_dict.items() if r <= 3}
-    ref_top5 = {m for m, r in ref_dict.items() if r <= 5}
-    pred_top3 = set(mp[mp["pred_rank"] <= 3]["model_key"].tolist())
-    pred_top5 = set(mp[mp["pred_rank"] <= 5]["model_key"].tolist())
-
-    top3_acc = len(pred_top3 & ref_top3) / 3.0
-    top5_acc = len(pred_top5 & ref_top5) / 5.0
-    exact_matches = sum(p == r for p, r in aligned)
-
-    return dict(
-        spearman_rho=float(rho),
-        kendall_tau=float(tau),
-        top3_acc=float(top3_acc),
-        top5_acc=float(top5_acc),
-        exact_matches=int(exact_matches),
-    )
 
 
 # ---------------------------------------------------------------------------
