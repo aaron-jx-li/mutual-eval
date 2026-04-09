@@ -1,36 +1,40 @@
 #!/usr/bin/env python3
 """
-Reward-only comparison for static-only, arena-only, and joint methods.
+Compare static-only, arena-only, and joint methods on math data.
 
 This script is designed for the math JSONL files in `data/hf/`:
 
 - `static_math_v0.jsonl` contains model responses on static math questions, but
-  its cached labels come from an LLM judge. This script ignores those judge
-  fields and uses `RewardClient` to score the static responses instead.
+  its cached labels come from an LLM judge.
 - `arena_math_v0.jsonl` already contains reward-model scores.
 
 Protocol
 --------
-1. Score static responses with `RewardClient` when a cached reward is missing.
-2. Hold out whole questions from the static and arena sources separately.
-3. Fit three reward-only models:
-   - static-only: train on reward-scored static questions
+1. Use one of two static supervision sources:
+   - `reward`: score static responses with `RewardClient` when a cached reward is
+     missing
+   - `judge`: use the cached binary `correct` labels already stored in the
+     static JSONL
+2. Hold out entries within each question from the static and arena sources
+   separately, while keeping every question present in the training split.
+3. Fit three methods:
+   - static-only: train on either static rewards or static judge labels
    - arena-only: train on arena reward questions
-   - joint: train on the union of both
-4. Evaluate on held-out questions using pairwise accuracy:
-   for each held-out question, compare every pair of model responses. The
-   "gold" winner is whichever response has higher reward. The model prediction
-   is whichever model has higher learned ability `theta`.
+   - joint:
+       * `reward` mode: train on the union of static and arena rewards
+       * `judge` mode: train with static binary labels plus arena rewards
+4. Evaluate on held-out entries using the shared `ranking.py` helpers:
+   - static: reconstruct correctness with `theta_i >= b_q`
+   - arena: reconstruct pairwise labels from held-out reward-induced pairs
+     using the learned question difficulty `b_q`
 5. Report a mixed held-out score:
 
        mixed_accuracy(p) = p * static_accuracy + (1 - p) * arena_accuracy
 
    where `0 <= p < 1` is the static share of the held-out metric.
 
-Important
----------
-This script never reads `correct`, `grading_method`, `judge_reason`, or any
-other LLM-judge outputs from the static file.
+In `reward` mode this script never reads `correct`, `grading_method`,
+`judge_reason`, or other LLM-judge outputs from the static file.
 """
 
 from __future__ import annotations
@@ -56,22 +60,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from ranking import fit_reward_irt  # noqa: E402
+from ranking import (  # noqa: E402
+    compute_static_agreement,
+    evaluate_joint_model,
+    fit_joint_reward_irt,
+    fit_reward_irt,
+    fit_static_irt,
+)
 from reward_client import RewardClient  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare static-only, arena-only, and joint reward-only methods on "
-            "a held-out mixed math set."
+            "Compare static-only, arena-only, and joint methods on a held-out "
+            "mixed math set."
         )
     )
     parser.add_argument(
         "--static-jsonl",
         type=Path,
         default=REPO_ROOT / "data" / "hf" / "static_math_v0.jsonl",
-        help="Static math JSONL. Judge fields are ignored.",
+        help=(
+            "Static math JSONL. In --static-target reward mode the judge fields "
+            "are ignored; in judge mode the cached `correct` labels are used."
+        ),
     )
     parser.add_argument(
         "--arena-jsonl",
@@ -95,7 +108,10 @@ def parse_args() -> argparse.Namespace:
         "--test-fraction",
         type=float,
         default=0.2,
-        help="Fraction of questions to hold out per source.",
+        help=(
+            "Fraction of per-question entries to hold out per source while "
+            "keeping every question present in the train split."
+        ),
     )
     parser.add_argument(
         "--test-static-ratio",
@@ -110,13 +126,34 @@ def parse_args() -> argparse.Namespace:
         "--pair-tie-eps",
         type=float,
         default=0.0,
-        help="Ignore held-out reward pairs with abs(reward_a - reward_b) <= this value.",
+        help=(
+            "When deriving held-out arena pairwise labels from rewards, mark "
+            "pairs with abs(reward_a - reward_b) <= this value as ties."
+        ),
     )
     parser.add_argument(
-        "--theta-tie-eps",
+        "--eval-tie-margin",
         type=float,
         default=0.0,
-        help="Ignore predicted pairs with abs(theta_a - theta_b) <= this value.",
+        help="Tie margin passed to ranking.evaluate_joint_model for arena evaluation.",
+    )
+    parser.add_argument(
+        "--eval-both-bad-thresh",
+        type=float,
+        default=-1.0,
+        help=(
+            "Both-bad threshold passed to ranking.evaluate_joint_model for arena "
+            "evaluation. Default disables both-bad predictions."
+        ),
+    )
+    parser.add_argument(
+        "--static-target",
+        choices=("reward", "judge"),
+        default="reward",
+        help=(
+            "How to supervise static questions: reward uses RewardClient/cached "
+            "static rewards, judge uses the cached binary `correct` labels."
+        ),
     )
     parser.add_argument(
         "--normalize-rewards",
@@ -399,7 +436,17 @@ def ensure_static_rewards(
     for row in static_rows:
         resolved = cache_by_key.get(static_row_key(row))
         if resolved is not None:
-            resolved_rows.append(resolved)
+            merged = dict(resolved)
+            for key in (
+                "correct",
+                "grading_method",
+                "judge_reason",
+                "judge_raw",
+                "status",
+            ):
+                if key in row and key not in merged:
+                    merged[key] = row.get(key)
+            resolved_rows.append(merged)
     return resolved_rows
 
 
@@ -420,6 +467,43 @@ def rows_to_reward_df(
             {
                 "source": source,
                 "question_id": question_id,
+                "model_name": row["model_label"],
+                "reward": float(row["reward"]),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def rows_to_static_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        records.append(
+            {
+                "source": "static",
+                "question_id": row.get("question_id") or static_question_id(row),
+                "model_name": row["model_label"],
+                "judge_result": (
+                    int(bool(row["correct"])) if row.get("correct") is not None else None
+                ),
+                "reward": (
+                    float(row["reward"]) if row.get("reward") is not None else None
+                ),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def rows_to_arena_response_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("status") != "ok" or row.get("reward") is None:
+            continue
+        records.append(
+            {
+                "source": "arena",
+                "question_id": arena_question_id(row),
                 "model_name": row["model_label"],
                 "reward": float(row["reward"]),
             }
@@ -460,25 +544,33 @@ def restrict_questions(
     return df[df["question_id"].isin(question_ids)].copy()
 
 
-def split_questions(
+def split_rows_within_question(
     df: pd.DataFrame,
     *,
     test_fraction: float,
     seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    question_ids = sorted(df["question_id"].unique())
-    if len(question_ids) < 2 or test_fraction <= 0:
+    if df.empty or test_fraction <= 0:
         return df.copy(), df.iloc[0:0].copy()
 
     rng = random.Random(seed)
-    rng.shuffle(question_ids)
+    train_parts: list[pd.DataFrame] = []
+    test_parts: list[pd.DataFrame] = []
 
-    n_test = int(round(len(question_ids) * test_fraction))
-    n_test = max(1, min(n_test, len(question_ids) - 1))
-    test_ids = set(question_ids[:n_test])
+    for question_id, group in df.groupby("question_id", sort=False):
+        group = group.sample(frac=1.0, random_state=rng.randint(0, 2**32 - 1)).copy()
+        n_rows = len(group)
+        if n_rows < 2:
+            train_parts.append(group)
+            continue
 
-    train_df = df[~df["question_id"].isin(test_ids)].copy()
-    test_df = df[df["question_id"].isin(test_ids)].copy()
+        n_test = int(round(n_rows * test_fraction))
+        n_test = max(1, min(n_test, n_rows - 1))
+        test_parts.append(group.iloc[:n_test].copy())
+        train_parts.append(group.iloc[n_test:].copy())
+
+    train_df = pd.concat(train_parts, ignore_index=True) if train_parts else df.iloc[0:0].copy()
+    test_df = pd.concat(test_parts, ignore_index=True) if test_parts else df.iloc[0:0].copy()
     return train_df, test_df
 
 
@@ -543,10 +635,10 @@ def fit_theta_map(
     num_epochs: int,
     lr: float,
     quiet: bool,
-) -> tuple[dict[str, float], pd.DataFrame]:
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
     if train_df.empty:
         raise ValueError("Cannot fit a reward-only method on an empty train set.")
-    model_params, _question_params = fit_reward_irt(
+    model_params, question_params = fit_reward_irt(
         train_df[["model_name", "question_id", "reward"]],
         num_epochs=num_epochs,
         lr=lr,
@@ -556,55 +648,150 @@ def fit_theta_map(
         row["model_name"]: float(row["theta"])
         for row in model_params.to_dict(orient="records")
     }
-    return theta_map, model_params
+    return theta_map, model_params, question_params
 
 
-def evaluate_pairwise_accuracy(
-    test_df: pd.DataFrame,
-    theta_map: dict[str, float],
+def fit_static_theta_map(
+    train_df: pd.DataFrame,
+    *,
+    num_epochs: int,
+    lr: float,
+    quiet: bool,
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
+    if train_df.empty:
+        raise ValueError("Cannot fit a static-only method on an empty train set.")
+    model_params, question_params = fit_static_irt(
+        train_df[["model_name", "question_id", "judge_result"]],
+        num_epochs=num_epochs,
+        lr=lr,
+        verbose=not quiet,
+    )
+    theta_map = {
+        row["model_name"]: float(row["theta"])
+        for row in model_params.to_dict(orient="records")
+    }
+    return theta_map, model_params, question_params
+
+
+def fit_joint_reward_theta_map(
+    static_train_df: pd.DataFrame,
+    arena_train_df: pd.DataFrame,
+    *,
+    num_epochs: int,
+    lr: float,
+    quiet: bool,
+) -> tuple[dict[str, float], pd.DataFrame, pd.DataFrame]:
+    if static_train_df.empty or arena_train_df.empty:
+        raise ValueError(
+            "Cannot fit joint static-judge + arena-reward model with an empty train set."
+        )
+    model_params, question_params = fit_joint_reward_irt(
+        static_train_df[["model_name", "question_id", "judge_result"]],
+        arena_train_df[["model_name", "question_id", "reward"]],
+        num_epochs=num_epochs,
+        lr=lr,
+        verbose=not quiet,
+    )
+    theta_map = {
+        row["model_name"]: float(row["theta"])
+        for row in model_params.to_dict(orient="records")
+    }
+    return theta_map, model_params, question_params
+
+
+def build_arena_pairwise_df(
+    arena_df: pd.DataFrame,
     *,
     pair_tie_eps: float,
-    theta_tie_eps: float,
-) -> dict[str, Any]:
-    correct = 0
-    total = 0
-    skipped_reward_ties = 0
-    skipped_theta_ties = 0
-    skipped_missing_theta = 0
-    question_counter = 0
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if arena_df.empty:
+        return pd.DataFrame(
+            columns=["question_id", "model_1", "model_2", "label"]
+        )
 
-    for question_id, group in test_df.groupby("question_id"):
-        question_counter += 1
-        rows = group[["model_name", "reward"]].dropna().to_dict(orient="records")
-        for left, right in combinations(rows, 2):
+    for question_id, group in arena_df.groupby("question_id", sort=False):
+        group = (
+            group[["question_id", "model_name", "reward"]]
+            .dropna(subset=["model_name", "reward"])
+            .sort_values("model_name")
+            .reset_index(drop=True)
+        )
+        if len(group) < 2:
+            continue
+        for idx_left, idx_right in combinations(range(len(group)), 2):
+            left = group.iloc[idx_left]
+            right = group.iloc[idx_right]
             reward_delta = float(left["reward"]) - float(right["reward"])
             if abs(reward_delta) <= pair_tie_eps:
-                skipped_reward_ties += 1
-                continue
-            theta_left = theta_map.get(str(left["model_name"]))
-            theta_right = theta_map.get(str(right["model_name"]))
-            if theta_left is None or theta_right is None:
-                skipped_missing_theta += 1
-                continue
-            theta_delta = theta_left - theta_right
-            if abs(theta_delta) <= theta_tie_eps:
-                skipped_theta_ties += 1
-                continue
+                label = 2
+            else:
+                label = 0 if reward_delta > 0 else 1
+            rows.append(
+                {
+                    "question_id": question_id,
+                    "model_1": str(left["model_name"]),
+                    "model_2": str(right["model_name"]),
+                    "label": label,
+                }
+            )
+    return pd.DataFrame(rows)
 
-            pred_left_wins = theta_delta > 0
-            gold_left_wins = reward_delta > 0
-            correct += int(pred_left_wins == gold_left_wins)
-            total += 1
 
-    return {
-        "accuracy": (correct / total) if total else None,
-        "correct_pairs": correct,
-        "total_pairs": total,
-        "questions": question_counter,
-        "skipped_reward_ties": skipped_reward_ties,
-        "skipped_theta_ties": skipped_theta_ties,
-        "skipped_missing_theta": skipped_missing_theta,
+def evaluate_with_helpers(
+    *,
+    static_test_df: pd.DataFrame,
+    arena_test_df: pd.DataFrame,
+    model_params: pd.DataFrame,
+    question_params: pd.DataFrame,
+    pair_tie_eps: float,
+    eval_tie_margin: float,
+    eval_both_bad_thresh: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    question_ids = set(question_params["question_id"].astype(str).tolist())
+
+    static_subset = static_test_df[
+        static_test_df["question_id"].astype(str).isin(question_ids)
+        & static_test_df["judge_result"].notna()
+    ].copy()
+    arena_subset = arena_test_df[
+        arena_test_df["question_id"].astype(str).isin(question_ids)
+        & arena_test_df["reward"].notna()
+    ].copy()
+    arena_pairwise_df = build_arena_pairwise_df(arena_subset, pair_tie_eps=pair_tie_eps)
+
+    eval_results = evaluate_joint_model(
+        static_subset if not static_subset.empty else None,
+        arena_pairwise_df if not arena_pairwise_df.empty else None,
+        model_params,
+        question_params,
+        tie_margin=eval_tie_margin,
+        both_bad_thresh=eval_both_bad_thresh,
+    )
+
+    static_payload: dict[str, Any] = {
+        "accuracy": None,
+        "rows": int(len(static_subset)),
+        "questions": int(static_subset["question_id"].nunique()) if not static_subset.empty else 0,
     }
+    if not static_subset.empty:
+        static_agreement = compute_static_agreement(static_subset, model_params, question_params)
+        static_payload["agreement_summary"] = static_agreement.to_dict(orient="records")
+        static_acc = eval_results.get("static_accuracy")
+        if static_acc is not None and not math.isnan(static_acc):
+            static_payload["accuracy"] = float(static_acc)
+
+    arena_payload: dict[str, Any] = {
+        "accuracy": None,
+        "pairs": int(len(arena_pairwise_df)),
+        "questions": int(arena_subset["question_id"].nunique()) if not arena_subset.empty else 0,
+        "tie_pairs": int((arena_pairwise_df["label"] == 2).sum()) if not arena_pairwise_df.empty else 0,
+    }
+    arena_acc = eval_results.get("arena_accuracy")
+    if arena_acc is not None and not math.isnan(arena_acc):
+        arena_payload["accuracy"] = float(arena_acc)
+
+    return static_payload, arena_payload
 
 
 def summarize_df(df: pd.DataFrame) -> dict[str, Any]:
@@ -660,10 +847,18 @@ def main() -> None:
     if not common_models:
         raise SystemExit("No overlapping model labels remain after filtering.")
 
-    static_raw_rows = [
-        row for row in static_raw_rows
-        if row.get("model_label") in common_models and row.get("response_text")
-    ]
+    if args.static_target == "reward":
+        static_raw_rows = [
+            row for row in static_raw_rows
+            if row.get("model_label") in common_models and row.get("response_text")
+        ]
+    else:
+        static_raw_rows = [
+            row for row in static_raw_rows
+            if row.get("model_label") in common_models
+            and row.get("status") == "ok"
+            and row.get("correct") is not None
+        ]
     arena_raw_rows = [
         row for row in arena_raw_rows
         if row.get("model_label") in common_models
@@ -682,117 +877,160 @@ def main() -> None:
         max_questions=args.max_arena_questions,
     )
 
-    reward_client = None
-    if rm_base_url and rm_token:
-        reward_client = RewardClient(base_url=rm_base_url, token=rm_token)
+    if args.static_target == "reward":
+        reward_client = None
+        if rm_base_url and rm_token:
+            reward_client = RewardClient(base_url=rm_base_url, token=rm_token)
 
-    static_reward_rows = ensure_static_rewards(
-        static_raw_rows,
-        cache_path=args.static_reward_cache,
-        reward_client=reward_client,
-        reward_timeout=args.reward_timeout,
-        reward_max_concurrency=args.reward_max_concurrency,
-        save_every=args.save_every,
-    )
-
-    static_df = rows_to_reward_df(static_reward_rows, source="static")
-    arena_df = rows_to_reward_df(arena_raw_rows, source="arena")
+        static_reward_rows = ensure_static_rewards(
+            static_raw_rows,
+            cache_path=args.static_reward_cache,
+            reward_client=reward_client,
+            reward_timeout=args.reward_timeout,
+            reward_max_concurrency=args.reward_max_concurrency,
+            save_every=args.save_every,
+        )
+        static_df = rows_to_static_df(static_reward_rows)
+    else:
+        static_df = rows_to_static_df(static_raw_rows)
+    arena_df = rows_to_arena_response_df(arena_raw_rows)
 
     if static_df.empty:
-        raise SystemExit("Static reward dataframe is empty after filtering.")
+        raise SystemExit("Static dataframe is empty after filtering.")
     if arena_df.empty:
         raise SystemExit("Arena reward dataframe is empty after filtering.")
 
-    static_train_df, static_test_df = split_questions(
+    static_train_df, static_test_df = split_rows_within_question(
         static_df,
         test_fraction=args.test_fraction,
         seed=args.seed,
     )
-    arena_train_df, arena_test_df = split_questions(
+    arena_train_df, arena_test_df = split_rows_within_question(
         arena_df,
         test_fraction=args.test_fraction,
         seed=args.seed + 1,
     )
 
-    static_train_norm, arena_train_norm, norm_stats = apply_reward_normalization(
-        static_train_df,
-        arena_train_df,
-        mode=args.normalize_rewards,
-    )
+    static_train_reward_df = static_train_df.dropna(subset=["reward"]).copy()
+    static_train_label_df = static_train_df.dropna(subset=["judge_result"]).copy()
+    static_test_eval_df = static_test_df.dropna(subset=["judge_result"]).copy()
+
+    if args.static_target == "reward":
+        static_train_norm, arena_train_norm, norm_stats = apply_reward_normalization(
+            static_train_reward_df,
+            arena_train_df,
+            mode=args.normalize_rewards,
+        )
+    else:
+        _unused_static_norm, arena_train_norm, norm_stats = apply_reward_normalization(
+            arena_train_df.iloc[0:0].copy(),
+            arena_train_df,
+            mode=args.normalize_rewards,
+        )
+        static_train_norm = static_train_label_df
 
     methods: dict[str, dict[str, Any]] = {}
 
-    static_only_theta, static_only_ranking = fit_theta_map(
-        static_train_norm,
-        num_epochs=args.num_epochs,
-        lr=args.lr,
-        quiet=args.quiet,
+    if args.static_target == "reward":
+        static_only_theta, static_only_ranking, static_only_questions = fit_theta_map(
+            static_train_norm,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            quiet=args.quiet,
+        )
+    else:
+        static_only_theta, static_only_ranking, static_only_questions = fit_static_theta_map(
+            static_train_norm,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            quiet=args.quiet,
+        )
+    static_test_metrics, static_arena_metrics = evaluate_with_helpers(
+        static_test_df=static_test_eval_df,
+        arena_test_df=arena_test_df,
+        model_params=static_only_ranking,
+        question_params=static_only_questions,
+        pair_tie_eps=args.pair_tie_eps,
+        eval_tie_margin=args.eval_tie_margin,
+        eval_both_bad_thresh=args.eval_both_bad_thresh,
     )
     methods["static_only"] = {
         "train_rows": int(len(static_train_norm)),
         "train_questions": int(static_train_norm["question_id"].nunique()),
         "model_ranking": static_only_ranking.to_dict(orient="records"),
-        "static_test": evaluate_pairwise_accuracy(
-            static_test_df,
-            static_only_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
-        "arena_test": evaluate_pairwise_accuracy(
-            arena_test_df,
-            static_only_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
+        "question_ranking": static_only_questions.to_dict(orient="records"),
+        "static_test": static_test_metrics,
+        "arena_test": static_arena_metrics,
     }
 
-    arena_only_theta, arena_only_ranking = fit_theta_map(
+    arena_only_theta, arena_only_ranking, arena_only_questions = fit_theta_map(
         arena_train_norm,
         num_epochs=args.num_epochs,
         lr=args.lr,
         quiet=args.quiet,
     )
+    arena_static_metrics, arena_test_metrics = evaluate_with_helpers(
+        static_test_df=static_test_eval_df,
+        arena_test_df=arena_test_df,
+        model_params=arena_only_ranking,
+        question_params=arena_only_questions,
+        pair_tie_eps=args.pair_tie_eps,
+        eval_tie_margin=args.eval_tie_margin,
+        eval_both_bad_thresh=args.eval_both_bad_thresh,
+    )
     methods["arena_only"] = {
         "train_rows": int(len(arena_train_norm)),
         "train_questions": int(arena_train_norm["question_id"].nunique()),
         "model_ranking": arena_only_ranking.to_dict(orient="records"),
-        "static_test": evaluate_pairwise_accuracy(
-            static_test_df,
-            arena_only_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
-        "arena_test": evaluate_pairwise_accuracy(
-            arena_test_df,
-            arena_only_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
+        "question_ranking": arena_only_questions.to_dict(orient="records"),
+        "static_test": arena_static_metrics,
+        "arena_test": arena_test_metrics,
     }
 
-    joint_train_norm = pd.concat([static_train_norm, arena_train_norm], ignore_index=True)
-    joint_theta, joint_ranking = fit_theta_map(
-        joint_train_norm,
-        num_epochs=args.num_epochs,
-        lr=args.lr,
-        quiet=args.quiet,
+    if args.static_target == "reward":
+        joint_train_norm = pd.concat([static_train_norm, arena_train_norm], ignore_index=True)
+        joint_theta, joint_ranking, joint_questions = fit_theta_map(
+            joint_train_norm,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            quiet=args.quiet,
+        )
+        joint_train_rows = int(len(joint_train_norm))
+        joint_train_questions = int(joint_train_norm["question_id"].nunique())
+    else:
+        joint_theta, joint_ranking, joint_questions = fit_joint_reward_theta_map(
+            static_train_norm,
+            arena_train_norm,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            quiet=args.quiet,
+        )
+        joint_train_rows = int(len(static_train_df) + len(arena_train_norm))
+        joint_train_questions = int(
+            pd.concat(
+                [
+                    static_train_df["question_id"],
+                    arena_train_norm["question_id"],
+                ],
+                ignore_index=True,
+            ).nunique()
+        )
+    joint_static_metrics, joint_arena_metrics = evaluate_with_helpers(
+        static_test_df=static_test_eval_df,
+        arena_test_df=arena_test_df,
+        model_params=joint_ranking,
+        question_params=joint_questions,
+        pair_tie_eps=args.pair_tie_eps,
+        eval_tie_margin=args.eval_tie_margin,
+        eval_both_bad_thresh=args.eval_both_bad_thresh,
     )
     methods["joint"] = {
-        "train_rows": int(len(joint_train_norm)),
-        "train_questions": int(joint_train_norm["question_id"].nunique()),
+        "train_rows": joint_train_rows,
+        "train_questions": joint_train_questions,
         "model_ranking": joint_ranking.to_dict(orient="records"),
-        "static_test": evaluate_pairwise_accuracy(
-            static_test_df,
-            joint_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
-        "arena_test": evaluate_pairwise_accuracy(
-            arena_test_df,
-            joint_theta,
-            pair_tie_eps=args.pair_tie_eps,
-            theta_tie_eps=args.theta_tie_eps,
-        ),
+        "question_ranking": joint_questions.to_dict(orient="records"),
+        "static_test": joint_static_metrics,
+        "arena_test": joint_arena_metrics,
     }
 
     for method_name, payload in methods.items():
@@ -815,8 +1053,10 @@ def main() -> None:
             "static_reward_cache": str(args.static_reward_cache),
             "test_fraction": args.test_fraction,
             "test_static_ratio": args.test_static_ratio,
+            "static_target": args.static_target,
             "pair_tie_eps": args.pair_tie_eps,
-            "theta_tie_eps": args.theta_tie_eps,
+            "eval_tie_margin": args.eval_tie_margin,
+            "eval_both_bad_thresh": args.eval_both_bad_thresh,
             "normalize_rewards": args.normalize_rewards,
             "num_epochs": args.num_epochs,
             "lr": args.lr,
@@ -848,7 +1088,7 @@ def main() -> None:
         ranking_path = args.output_dir / f"{method_name}_model_ranking.csv"
         pd.DataFrame(payload["model_ranking"]).to_csv(ranking_path, index=False)
 
-    print("\nHeld-out pairwise accuracy")
+    print("\nHeld-out evaluation")
     print("-" * 90)
     print(
         f"{'method':14} {'static_test':>12} {'arena_test':>12} {'mixed(p)':>12} "
