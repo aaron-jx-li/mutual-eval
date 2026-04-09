@@ -13,9 +13,14 @@ Usage
 python robustness/greedy_selection.py --strategy random \\
     --hard-cap 150 --candidates 50 --seeds 0 1 2
 
-# With a specific JSONL file
+# With a specific static JSONL file
 python robustness/greedy_selection.py --strategy random \\
     --static-jsonl data/new/static_coding_v0.jsonl \\
+    --hard-cap 150 --candidates 50 --seeds 0 1 2
+
+# With an arena reward JSONL file (mode auto-detected)
+python robustness/greedy_selection.py --strategy random \\
+    --arena-jsonl data/new/arena_math_v0.jsonl \\
     --hard-cap 150 --candidates 50 --seeds 0 1 2
 
 # Level-diversity batch greedy
@@ -38,8 +43,8 @@ import pandas as pd
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ranking import fit_static_irt
-from robustness.data_utils import load_static, load_static_jsonl
+from ranking import fit_static_irt, fit_reward_irt
+from robustness.data_utils import load_static, load_static_jsonl, load_arena_reward
 from robustness.metrics import save_results, compute_all_metrics
 from robustness.common_cli import base_parser
 from robustness.reference_rankings import REFERENCE_RANKINGS
@@ -49,11 +54,11 @@ def _file_stem(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
-def _experiment_labels(static_csv: str | None, static_jsonl: str) -> tuple[str, str]:
+def _experiment_labels(static_csv: str | None, jsonl_path: str) -> tuple[str, str]:
     """Return (filetype, dataset) strings for folder naming."""
     if static_csv:
         return "static", "csv"
-    stem = _file_stem(static_jsonl)
+    stem = _file_stem(jsonl_path)
     parts = stem.split("_")
     return parts[0], (parts[1] if len(parts) >= 2 else stem)
 
@@ -63,13 +68,21 @@ def _experiment_labels(static_csv: str | None, static_jsonl: str) -> tuple[str, 
 # ---------------------------------------------------------------------------
 
 
-def _fit_metric(df: pd.DataFrame, ref_ranking: dict, num_epochs: int, metric: str = "kendall_tau") -> float:
+def _fit_metric(
+    df: pd.DataFrame,
+    ref_ranking: dict,
+    num_epochs: int,
+    metric: str = "kendall_tau",
+    irt_func=None,
+) -> float:
     """
     Fit IRT on df and return the chosen metric vs. ref_ranking.
     Always runs silently (verbose=False). Returns -2.0 on failure.
     """
+    if irt_func is None:
+        irt_func = fit_static_irt
     try:
-        mp, _ = fit_static_irt(df, num_epochs=num_epochs, verbose=False)
+        mp, _ = irt_func(df, num_epochs=num_epochs, verbose=False)
         return compute_all_metrics(mp, ref_ranking)[metric]
     except Exception:
         return -2.0
@@ -124,7 +137,7 @@ def _level_label(v) -> str:
 # ---------------------------------------------------------------------------
 
 def run_greedy_random(
-    static_df: pd.DataFrame,
+    data_df: pd.DataFrame,
     ref_ranking: dict,
     *,
     hard_cap: int,
@@ -135,6 +148,7 @@ def run_greedy_random(
     num_epochs: int,
     quiet: bool,
     metric: str = "kendall_tau",
+    irt_func=None,
 ) -> list[dict]:
     """
     Forward greedy with random candidate subsampling.
@@ -151,9 +165,11 @@ def run_greedy_random(
     -------
     (rows, greedy_set) : tuple[list[dict], set]
     """
+    if irt_func is None:
+        irt_func = fit_static_irt
     rng = np.random.default_rng(seed)
-    all_qids = static_df["question_id"].unique()
-    qid_level = _build_qid_level_map(static_df)
+    all_qids = data_df["question_id"].unique()
+    qid_level = _build_qid_level_map(data_df)
 
     start_qid = rng.choice(all_qids)
     greedy_set: set = {start_qid}
@@ -170,8 +186,8 @@ def run_greedy_random(
 
         best_q, best_score = None, -2.0
         for q in candidates:
-            trial_df = static_df[static_df["question_id"].isin(greedy_set | {q})]
-            score = _fit_metric(trial_df, ref_ranking, num_epochs, metric)
+            trial_df = data_df[data_df["question_id"].isin(greedy_set | {q})]
+            score = _fit_metric(trial_df, ref_ranking, num_epochs, metric, irt_func)
             if score > best_score:
                 best_score, best_q = score, q
 
@@ -330,24 +346,43 @@ def main() -> None:
     parser = base_parser("Greedy question selection")
     parser.add_argument("--strategy", choices=["random", "diverse"], default="random", help="random: random candidate subsampling; diverse: level-diversity batch greedy")
     parser.add_argument("--hard-cap", type=int, default=150, help="Maximum total questions in the selected set")
-    parser.add_argument("--candidates", type=int, default=50, help="[random] Candidate questions sampled per step")
-    parser.add_argument("--n-batches", type=int, default=10, help="[diverse] Diverse batches evaluated per step")
-    parser.add_argument("--metric", choices=["spearman_rho", "kendall_tau"], default="kendall_tau", help="Metric used for greedy selection and convergence")
-    parser.add_argument("--threshold", type=float, default=0.95, help="Convergence threshold for the chosen metric")
+    parser.add_argument("--candidates", "-c", type=int, default=50, help="[random] Candidate questions sampled per step")
+    parser.add_argument("--n-batches", "-n", type=int, default=10, help="[diverse] Diverse batches evaluated per step")
+    parser.add_argument("--metric", "-m", choices=["spearman_rho", "kendall_tau"], default="kendall_tau", help="Metric used for greedy selection and convergence")
+    parser.add_argument("--threshold", "-t", type=float, default=0.95, help="Convergence threshold for the chosen metric")
     parser.add_argument("--consecutive", type=int, default=3, help="Consecutive steps above threshold to declare convergence")
     # Lower epoch default for speed; user can override with --num-epochs
-    parser.set_defaults(num_epochs=500, seeds=[0, 1, 2])
+    # Override base_parser JSONL defaults to None so we can detect which was explicitly passed
+    parser.set_defaults(num_epochs=500, seeds=[0, 1, 2], static_jsonl=None, arena_jsonl=None)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Load data
+    # Auto-detect mode from which JSONL argument was explicitly passed
     # ------------------------------------------------------------------
     if args.static_csv:
-        static_df = load_static(args.static_csv)
+        mode = "static"
+        data_df = load_static(args.static_csv)
+    elif args.static_jsonl is not None and args.arena_jsonl is not None:
+        print("[WARNING] Both --static-jsonl and --arena-jsonl were passed; ignoring --arena-jsonl and using static mode.")
+        mode = "static"
+        data_df = load_static_jsonl(args.static_jsonl)
+    elif args.arena_jsonl is not None:
+        mode = "arena"
+        data_df = load_arena_reward(args.arena_jsonl)
     else:
-        static_df = load_static_jsonl(args.static_jsonl)
+        # static_jsonl explicitly passed, or neither (fall back to default static)
+        mode = "static"
+        jsonl_path = args.static_jsonl or "data/new/static_math_v0.jsonl"
+        data_df = load_static_jsonl(jsonl_path)
+        args.static_jsonl = jsonl_path
+
+    irt_func = fit_reward_irt if mode == "arena" else fit_static_irt
+
+    # Diverse strategy requires a level column absent from arena data
+    if args.strategy == "diverse" and mode == "arena":
+        parser.error("--strategy diverse requires a 'level' column and is not supported for arena data")
 
     # ------------------------------------------------------------------
     # Resolve reference ranking
@@ -356,13 +391,18 @@ def main() -> None:
         # CSV mode: fit reference dynamically (no hardcoded dict for arbitrary CSVs)
         if not args.quiet:
             print("Fitting reference IRT on full dataset ...")
-        ref_mp, _ = fit_static_irt(static_df, num_epochs=args.num_epochs, verbose=not args.quiet)
+        ref_mp, _ = fit_static_irt(data_df, num_epochs=args.num_epochs, verbose=not args.quiet)
         ref_ranking: dict = {m.lower(): i + 1 for i, m in enumerate(ref_mp["model_name"])}
         if not args.quiet:
             print("Reference ranking:")
             for name, rank in sorted(ref_ranking.items(), key=lambda x: x[1]):
                 print(f"  {rank:2d}. {name}")
             print()
+    elif mode == "arena":
+        stem = _file_stem(args.arena_jsonl)
+        ref_ranking: dict = REFERENCE_RANKINGS[stem]
+        if not args.quiet:
+            print(f"Using hardcoded reference ranking for '{stem}'")
     else:
         # JSONL mode: use hardcoded reference ranking
         stem = _file_stem(args.static_jsonl)
@@ -374,7 +414,10 @@ def main() -> None:
     # Set up output folder before seed loop (needed for per-seed steps files)
     # ------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    filetype, dataset = _experiment_labels(args.static_csv, args.static_jsonl)
+    if mode == "arena":
+        filetype, dataset = _experiment_labels(None, args.arena_jsonl)
+    else:
+        filetype, dataset = _experiment_labels(args.static_csv, args.static_jsonl)
     if args.strategy == "random":
         params = f"cap{args.hard_cap}_c{args.candidates}"
     else:
@@ -386,16 +429,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Run greedy for each seed
     # ------------------------------------------------------------------
-    total_q = len(static_df["question_id"].unique())
+    total_q = len(data_df["question_id"].unique())
     seed_metric_rows: list[dict] = []
 
     for seed in args.seeds:
         if not args.quiet:
-            print(f"=== Seed {seed} | strategy={args.strategy} | metric={args.metric} ===")
+            print(f"=== Seed {seed} | strategy={args.strategy} | mode={mode} | metric={args.metric} ===")
 
         if args.strategy == "random":
             rows, final_set = run_greedy_random(
-                static_df,
+                data_df,
                 ref_ranking,
                 hard_cap=args.hard_cap,
                 candidates_per_step=args.candidates,
@@ -405,10 +448,11 @@ def main() -> None:
                 num_epochs=args.num_epochs,
                 quiet=args.quiet,
                 metric=args.metric,
+                irt_func=irt_func,
             )
         else:
             rows, final_set = run_greedy_diverse(
-                static_df,
+                data_df,
                 ref_ranking,
                 hard_cap=args.hard_cap,
                 n_batches=args.n_batches,
@@ -426,8 +470,8 @@ def main() -> None:
         save_results(rows, seed_folder, "steps.csv")
 
         # Fit IRT on final greedy question set and compute metrics
-        final_df = static_df[static_df["question_id"].isin(final_set)]
-        final_mp, _ = fit_static_irt(final_df, num_epochs=args.num_epochs, verbose=False)
+        final_df = data_df[data_df["question_id"].isin(final_set)]
+        final_mp, _ = irt_func(final_df, num_epochs=args.num_epochs, verbose=False)
         metrics = compute_all_metrics(final_mp, ref_ranking)
         frac = len(final_set) / total_q
         seed_metric_rows.append({"seed": seed, "fraction_of_data": frac, **metrics})
