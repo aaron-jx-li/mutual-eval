@@ -50,6 +50,7 @@ from __future__ import annotations
 import os
 import sys
 
+import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -606,10 +607,12 @@ def main() -> None:
     else:
         total_q = len(data_df["question_id"].unique())
     seed_metric_rows: list[dict] = []
+    t_total_start = time.perf_counter()
 
     for seed in args.seeds:
         if not args.quiet:
             print(f"=== Seed {seed} | strategy={args.strategy} | mode={mode} | metric={args.metric} ===")
+        t_seed_start = time.perf_counter()
 
         if mode == "joint-reward":
             rows, static_set, arena_set = run_greedy_joint_reward(
@@ -653,6 +656,9 @@ def main() -> None:
                 quiet=args.quiet,
                 metric=args.metric,
             )
+
+        t_seed_elapsed = time.perf_counter() - t_seed_start
+        print(f"  Seed {seed} elapsed: {t_seed_elapsed:.1f}s")
 
         # Create per-seed subfolder and save steps, ranking, sampled_questions
         seed_folder = os.path.join(out_folder, f"seed_{seed}")
@@ -725,6 +731,7 @@ def main() -> None:
     summary = pd.concat([metrics_df, pd.DataFrame([mean_row])], ignore_index=True)
     summary.to_csv(os.path.join(out_folder, "metrics.csv"), index=False)
     print(f"  Saved: {out_folder}/metrics.csv")
+    print(f"  Total elapsed: {time.perf_counter() - t_total_start:.1f}s")
 
 
 if __name__ == "__main__":
