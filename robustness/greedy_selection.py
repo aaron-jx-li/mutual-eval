@@ -7,6 +7,12 @@ robustness/greedy_selection.py
 Both experiments incrementally build a question set whose IRT-derived model ranking
 converges to the full-dataset reference ranking, measured by Kendall's tau.
 
+Mode is auto-detected from the combination of arguments passed:
+  --static-jsonl only          → static mode (fit_static_irt)
+  --arena-jsonl only           → arena mode (fit_reward_irt)
+  --static-jsonl + arena-jsonl → joint-reward mode (fit_joint_reward_irt)
+  --static-csv                 → CSV static mode
+
 Usage
 -----
 # Random candidate subsampling (default: math JSONL)
@@ -23,7 +29,13 @@ python robustness/greedy_selection.py --strategy random \\
     --arena-jsonl data/new/arena_math_v0.jsonl \\
     --hard-cap 150 --candidates 50 --seeds 0 1 2
 
-# Level-diversity batch greedy
+# Joint static + arena reward (both files → joint-reward mode)
+python robustness/greedy_selection.py --strategy random \\
+    --static-jsonl data/new/static_math_v0.jsonl \\
+    --arena-jsonl data/new/arena_math_v0.jsonl \\
+    --hard-cap 150 --candidates 50 --seeds 0 1 2
+
+# Level-diversity batch greedy (static only)
 python robustness/greedy_selection.py --strategy diverse \\
     --hard-cap 150 --n-batches 10 --seeds 0 1 2
 
@@ -43,11 +55,11 @@ import pandas as pd
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ranking import fit_static_irt, fit_reward_irt
+from ranking import fit_static_irt, fit_reward_irt, fit_joint_reward_irt
 from robustness.data_utils import load_static, load_static_jsonl, load_arena_reward
 from robustness.metrics import save_results, compute_all_metrics
 from robustness.common_cli import base_parser
-from robustness.reference_rankings import REFERENCE_RANKINGS
+from robustness.reference_rankings import REFERENCE_RANKINGS, JOINT_REFERENCE_RANKINGS
 
 
 def _file_stem(path: str) -> str:
@@ -130,6 +142,25 @@ def _build_qid_level_map(static_df: pd.DataFrame) -> dict:
 def _level_label(v) -> str:
     """Human-readable level label."""
     return "gsm" if v is None else str(v)
+
+
+# ---------------------------------------------------------------------------
+# Joint metric helper
+# ---------------------------------------------------------------------------
+
+def _fit_metric_joint(
+    static_df: pd.DataFrame,
+    arena_df: pd.DataFrame,
+    ref_ranking: dict,
+    num_epochs: int,
+    metric: str = "kendall_tau",
+) -> float:
+    """Fit joint IRT on (static_df, arena_df) and return the chosen metric vs. ref_ranking."""
+    try:
+        mp, _ = fit_joint_reward_irt(static_df, arena_df, num_epochs=num_epochs, verbose=False)
+        return compute_all_metrics(mp, ref_ranking)[metric]
+    except Exception:
+        return -2.0
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +256,132 @@ def run_greedy_random(
             consecutive_above = 0
 
     return rows, greedy_set
+
+
+# ---------------------------------------------------------------------------
+# Strategy: joint-reward (static + arena reward, unified candidate pool)
+# ---------------------------------------------------------------------------
+
+def run_greedy_joint_reward(
+    static_df: pd.DataFrame,
+    arena_df: pd.DataFrame,
+    ref_ranking: dict,
+    *,
+    hard_cap: int,
+    candidates_per_step: int,
+    threshold: float,
+    consecutive_needed: int,
+    seed: int,
+    num_epochs: int,
+    quiet: bool,
+    metric: str = "kendall_tau",
+) -> tuple[list[dict], set, set]:
+    """
+    Forward greedy with joint static+arena-reward IRT and unified candidate sampling.
+
+    Two separate question pools (static and arena) are maintained. At each step,
+    candidates_per_step // 2 candidates are drawn from each remaining pool and
+    evaluated by fitting fit_joint_reward_irt on the current selected sets plus
+    the candidate. The single best candidate across both pools is added to its
+    respective pool.
+
+    Initializes with 1 question from each pool so both DataFrames are non-empty
+    for fit_joint_reward_irt from step 1 onward.
+
+    hard_cap applies to the total number of selected questions across both pools.
+
+    Returns
+    -------
+    (rows, static_selected, arena_selected)
+    """
+    rng = np.random.default_rng(seed)
+    all_static_qids = static_df["question_id"].unique()
+    all_arena_qids = arena_df["question_id"].unique()
+
+    # Seed with 1 question from each pool
+    start_static = rng.choice(all_static_qids)
+    start_arena = rng.choice(all_arena_qids)
+    static_selected: set = {start_static}
+    arena_selected: set = {start_arena}
+    static_remaining: set = set(all_static_qids) - static_selected
+    arena_remaining: set = set(all_arena_qids) - arena_selected
+
+    rows: list[dict] = []
+    consecutive_above = 0
+    step = 0
+
+    while (len(static_selected) + len(arena_selected)) < hard_cap and (
+        static_remaining or arena_remaining
+    ):
+        step += 1
+        half = max(1, candidates_per_step // 2)
+
+        best_q, best_source, best_score = None, None, -2.0
+
+        # Evaluate static candidates
+        if static_remaining:
+            m = min(half, len(static_remaining))
+            for q in rng.choice(list(static_remaining), size=m, replace=False):
+                trial_static = static_df[static_df["question_id"].isin(static_selected | {q})]
+                trial_arena = arena_df[arena_df["question_id"].isin(arena_selected)]
+                score = _fit_metric_joint(trial_static, trial_arena, ref_ranking, num_epochs, metric)
+                if score > best_score:
+                    best_score, best_q, best_source = score, q, "static"
+
+        # Evaluate arena candidates
+        if arena_remaining:
+            m = min(half, len(arena_remaining))
+            for q in rng.choice(list(arena_remaining), size=m, replace=False):
+                trial_static = static_df[static_df["question_id"].isin(static_selected)]
+                trial_arena = arena_df[arena_df["question_id"].isin(arena_selected | {q})]
+                score = _fit_metric_joint(trial_static, trial_arena, ref_ranking, num_epochs, metric)
+                if score > best_score:
+                    best_score, best_q, best_source = score, q, "arena"
+
+        if best_q is None:
+            break
+
+        if best_source == "static":
+            static_selected.add(best_q)
+            static_remaining.discard(best_q)
+        else:
+            arena_selected.add(best_q)
+            arena_remaining.discard(best_q)
+
+        n_total = len(static_selected) + len(arena_selected)
+        rows.append({
+            "step":        step,
+            "source":      best_source,
+            "question_id": best_q,
+            "score":       best_score,
+            "n_questions": n_total,
+            "n_static":    len(static_selected),
+            "n_arena":     len(arena_selected),
+            "seed":        seed,
+            "strategy":    "random",
+            "metric":      metric,
+        })
+
+        if not quiet:
+            print(
+                f"  [joint] step {step:3d} | added {best_q} (source={best_source}) "
+                f"| {metric}={best_score:.4f} | n={n_total} "
+                f"(static={len(static_selected)}, arena={len(arena_selected)})"
+            )
+
+        if best_score >= threshold:
+            consecutive_above += 1
+            if consecutive_above >= consecutive_needed:
+                if not quiet:
+                    print(
+                        f"  Converged: {metric} >= {threshold} for "
+                        f"{consecutive_needed} consecutive steps."
+                    )
+                break
+        else:
+            consecutive_above = 0
+
+    return rows, static_selected, arena_selected
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +522,10 @@ def main() -> None:
         mode = "static"
         data_df = load_static(args.static_csv)
     elif args.static_jsonl is not None and args.arena_jsonl is not None:
-        print("[WARNING] Both --static-jsonl and --arena-jsonl were passed; ignoring --arena-jsonl and using static mode.")
-        mode = "static"
-        data_df = load_static_jsonl(args.static_jsonl)
+        mode = "joint-reward"
+        data_df = None  # not used in joint mode; static_df/arena_df set below
+        static_df = load_static_jsonl(args.static_jsonl)
+        arena_df = load_arena_reward(args.arena_jsonl)
     elif args.arena_jsonl is not None:
         mode = "arena"
         data_df = load_arena_reward(args.arena_jsonl)
@@ -380,9 +538,9 @@ def main() -> None:
 
     irt_func = fit_reward_irt if mode == "arena" else fit_static_irt
 
-    # Diverse strategy requires a level column absent from arena data
-    if args.strategy == "diverse" and mode == "arena":
-        parser.error("--strategy diverse requires a 'level' column and is not supported for arena data")
+    # Diverse strategy requires a level column absent from arena/joint data
+    if args.strategy == "diverse" and mode in ("arena", "joint-reward"):
+        parser.error("--strategy diverse requires a 'level' column and is not supported for arena or joint-reward data")
 
     # ------------------------------------------------------------------
     # Resolve reference ranking
@@ -398,6 +556,12 @@ def main() -> None:
             for name, rank in sorted(ref_ranking.items(), key=lambda x: x[1]):
                 print(f"  {rank:2d}. {name}")
             print()
+    elif mode == "joint-reward":
+        static_stem = _file_stem(args.static_jsonl)
+        arena_stem = _file_stem(args.arena_jsonl)
+        ref_ranking: dict = JOINT_REFERENCE_RANKINGS[(static_stem, arena_stem)]
+        if not args.quiet:
+            print(f"Using hardcoded joint reference ranking for ('{static_stem}', '{arena_stem}')")
     elif mode == "arena":
         stem = _file_stem(args.arena_jsonl)
         ref_ranking: dict = REFERENCE_RANKINGS[stem]
@@ -414,29 +578,55 @@ def main() -> None:
     # Set up output folder before seed loop (needed for per-seed steps files)
     # ------------------------------------------------------------------
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    if mode == "arena":
-        filetype, dataset = _experiment_labels(None, args.arena_jsonl)
-    else:
-        filetype, dataset = _experiment_labels(args.static_csv, args.static_jsonl)
-    if args.strategy == "random":
+    if mode == "joint-reward":
+        static_stem = _file_stem(args.static_jsonl)
+        arena_stem = _file_stem(args.arena_jsonl)
         params = f"cap{args.hard_cap}_c{args.candidates}"
+        folder_name = f"{args.strategy}_joint_{static_stem}+{arena_stem}_{params}_{timestamp}"
     else:
-        params = f"cap{args.hard_cap}_b{args.n_batches}"
-    folder_name = f"{args.strategy}_{filetype}_{dataset}_{params}_{timestamp}"
+        if mode == "arena":
+            filetype, dataset = _experiment_labels(None, args.arena_jsonl)
+        else:
+            filetype, dataset = _experiment_labels(args.static_csv, args.static_jsonl)
+        if args.strategy == "random":
+            params = f"cap{args.hard_cap}_c{args.candidates}"
+        else:
+            params = f"cap{args.hard_cap}_b{args.n_batches}"
+        folder_name = f"{args.strategy}_{filetype}_{dataset}_{params}_{timestamp}"
     out_folder = os.path.join(args.out_dir, "greedy", folder_name)
     os.makedirs(out_folder, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Run greedy for each seed
     # ------------------------------------------------------------------
-    total_q = len(data_df["question_id"].unique())
+    if mode == "joint-reward":
+        total_q = (
+            len(static_df["question_id"].unique()) + len(arena_df["question_id"].unique())
+        )
+    else:
+        total_q = len(data_df["question_id"].unique())
     seed_metric_rows: list[dict] = []
 
     for seed in args.seeds:
         if not args.quiet:
             print(f"=== Seed {seed} | strategy={args.strategy} | mode={mode} | metric={args.metric} ===")
 
-        if args.strategy == "random":
+        if mode == "joint-reward":
+            rows, static_set, arena_set = run_greedy_joint_reward(
+                static_df,
+                arena_df,
+                ref_ranking,
+                hard_cap=args.hard_cap,
+                candidates_per_step=args.candidates,
+                threshold=args.threshold,
+                consecutive_needed=args.consecutive,
+                seed=seed,
+                num_epochs=args.num_epochs,
+                quiet=args.quiet,
+                metric=args.metric,
+            )
+            final_set = static_set | arena_set
+        elif args.strategy == "random":
             rows, final_set = run_greedy_random(
                 data_df,
                 ref_ranking,
@@ -470,8 +660,15 @@ def main() -> None:
         save_results(rows, seed_folder, "steps.csv")
 
         # Fit IRT on final greedy question set and compute metrics
-        final_df = data_df[data_df["question_id"].isin(final_set)]
-        final_mp, _ = irt_func(final_df, num_epochs=args.num_epochs, verbose=False)
+        if mode == "joint-reward":
+            final_static_df = static_df[static_df["question_id"].isin(static_set)]
+            final_arena_df = arena_df[arena_df["question_id"].isin(arena_set)]
+            final_mp, _ = fit_joint_reward_irt(
+                final_static_df, final_arena_df, num_epochs=args.num_epochs, verbose=False
+            )
+        else:
+            final_df = data_df[data_df["question_id"].isin(final_set)]
+            final_mp, _ = irt_func(final_df, num_epochs=args.num_epochs, verbose=False)
         metrics = compute_all_metrics(final_mp, ref_ranking)
         frac = len(final_set) / total_q
         seed_metric_rows.append({"seed": seed, "fraction_of_data": frac, **metrics})
@@ -486,9 +683,17 @@ def main() -> None:
         rank_df = final_mp.copy().reset_index(drop=True)
         rank_df.insert(0, "rank", range(1, len(rank_df) + 1))
         rank_df.to_csv(os.path.join(seed_folder, "ranking.csv"), index=False)
-        pd.DataFrame({"question_id": sorted(final_set)}).to_csv(
-            os.path.join(seed_folder, "sampled_questions.csv"), index=False
-        )
+        if mode == "joint-reward":
+            pd.DataFrame({"question_id": sorted(static_set)}).to_csv(
+                os.path.join(seed_folder, "sampled_static_questions.csv"), index=False
+            )
+            pd.DataFrame({"question_id": sorted(arena_set)}).to_csv(
+                os.path.join(seed_folder, "sampled_arena_questions.csv"), index=False
+            )
+        else:
+            pd.DataFrame({"question_id": sorted(final_set)}).to_csv(
+                os.path.join(seed_folder, "sampled_questions.csv"), index=False
+            )
         print(f"  Saved: {seed_folder}/")
 
     # ------------------------------------------------------------------
