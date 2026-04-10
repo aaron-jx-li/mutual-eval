@@ -14,12 +14,13 @@ All experiments run on the **math task only** (`data/static_10_models.csv`: 500 
 | `common_cli.py` | Shared argparse flags (`--static-csv`, `--arena-csv`, `--out-dir`, `--seeds`, etc.) |
 | `seed_stability.py` | Verify IRT is stable across random seeds before running any experiments |
 | `sparsity_random.py` | Exp 1: randomly subsample questions and measure rank correlation vs. fraction kept |
-| `new_model_ranking.py` | Exp 2: LOO simulation — how few questions are needed to rank a new (held-out) model? |
-| `new_question_calibration.py` | Exp 3: how few model responses are needed to estimate a new question's b_q and a_q? |
-| `sparsity_stratified.py` | Exp 4: level-stratified sampling — which difficulty levels are most informative? |
-| `label_noise.py` | Exp 5: label corruption — which corruptions most destabilize rankings? |
-| `add_hendrycks_metadata.py` | Exp 6 (stretch): extract Hendrycks MATH categories and add `category` column for category-stratified sampling |
-| `greedy_selection.py` | Exp 7 & 8: greedy question selection — `--strategy random` (Exp 7) or `--strategy diverse` (Exp 8) |
+| `reference_rankings.py` | Compute reference rankings (full-data IRT fits) used as the baseline for all experiments |
+| `greedy_selection.py` | Exp 2 & 3: greedy question selection — `--strategy random` (Exp 2) or `--strategy diverse` (Exp 3) |
+| `new_model_ranking.py` | Exp 4: LOO simulation — how few questions are needed to rank a new (held-out) model? |
+| `new_question_calibration.py` | Exp 5: how few model responses are needed to estimate a new question's b_q and a_q? |
+| `sparsity_stratified.py` | Exp 6: level-stratified sampling — which difficulty levels are most informative? |
+| `label_noise.py` | Exp 7: label corruption — which corruptions most destabilize rankings? |
+| `add_hendrycks_metadata.py` | Exp 8 (stretch): extract Hendrycks MATH categories and add `category` column for category-stratified sampling |
 | `run_experiments.py` | Top-level CLI orchestrator to run any or all experiments |
 | `results/` | CSV outputs and plots from each experiment |
 
@@ -73,26 +74,26 @@ Runs `fit_static_irt` on the full dataset with multiple random seeds and compute
 ### Exp 1 — Random Question Subsampling
 Randomly keeps a fraction `f` of the 500 questions (all 10 model responses retained per question) and re-fits IRT. Produces a ρ-vs-fraction curve to find the "elbow" — the minimum number of questions that still recovers the full-data ranking. This is the baseline sparsification result.
 
-### Exp 2 — New Model Ranking
-Simulates adding an 11th model to an existing benchmark. Uses leave-one-out: hold out model `i`, vary the question budget `k ∈ [10, 25, 50, 100, 200, 300, 500]`, fit IRT on all 10 models with only `k` questions, and measure how accurately the held-out model's rank is recovered. Repeated across all 10 models and 5 seeds per `(model, k)` pair to get stable estimates of rank error.
-
-### Exp 3 — New Question Calibration
-Simulates adding a new question to an existing item bank. Holds out one question at a time, varies how many of the 10 models answer it (`k ∈ [2, 3, 4, 5, 6, 8, 10]`), re-fits IRT, and measures MAE of the estimated `b_q` (difficulty) and `a_q` (discrimination) vs. the full-data reference. Identifies the minimum number of model responses needed to reliably characterize a question's psychometric properties.
-
-### Exp 4 — Level-Stratified Sampling
-Tests whether the difficulty composition of the question set matters. Uses the pre-existing `level` column (NaN = GSM-8k word problems; Levels 1–5 = Hendrycks MATH) to construct subsets with different level mixes (e.g., GSM-only, Hendrycks-only, hard-only, uniform across levels). Answers: "if you have a fixed question budget, which difficulty levels should you prioritize?"
-
-### Exp 5 — Label Corruption
-Deliberately corrupts `judge_result` labels and measures ranking degradation. Tests both random flips (uniform noise) and targeted flips (easy-only, hard-only, or all responses for one model). The per-model inflation/deflation variants identify which models' positions are most sensitive to systematic annotation errors.
-
-### Exp 6 — Hendrycks Category Metadata *(stretch)*
-Tests whether category-stratified sampling (Algebra, Number Theory, Geometry, etc.) beats level-stratified sampling for a fixed question budget. First checks whether Hendrycks MATH categories can be recovered from `question_id` structure or by matching question text against the public Hendrycks MATH dataset. If feasible, adds a `category` column via `add_hendrycks_metadata.py` and reruns Exp 4-style stratification schemes by category instead of level.
-
-### Exp 7 — Greedy Question Selection with Candidate Subsampling
+### Exp 2 — Greedy Question Selection with Candidate Subsampling
 Forward greedy search for a minimal question set that recovers the full-data model ranking. At each step, randomly samples m=50 candidate questions and selects the one whose addition maximizes Kendall's τ against the full-data reference ranking. Subsampling caps compute at exactly 50 IRT fits/step (vs. up to ~450 for full greedy), reducing runtime ~9x while preserving the one-at-a-time greedy property. Run with 3 seeds to verify stability. Terminates when τ > 0.95 for 3 consecutive steps or hard cap is reached (150 for 2PL, 200 for pairwise IRT). The level distribution of selected questions connects to Exp 4 findings.
 
-### Exp 8 — Diversity-Batched Greedy Question Selection
-Improves on Exp 7 by adding questions in level-diverse batches. At each step, constructs `n_batches=10` candidate batches by sampling one question from each difficulty level group (GSM-8k + Levels 1–5), evaluates all 10 batches via IRT, and adds the best batch (~6 questions). Enforces difficulty diversity by construction rather than hoping for it via random sampling. Primary comparison against Exp 7: does level diversity accelerate convergence to τ > 0.95, and does it do so with fewer total IRT fits? All three methods (Exp 1 random, Exp 7, Exp 8) are plotted on the same τ-vs-questions-added axes.
+### Exp 3 — Diversity-Batched Greedy Question Selection -- TODO
+Improves on Exp 2 by adding questions in level-diverse batches. At each step, constructs `n_batches=10` candidate batches by sampling one question from each difficulty level group (GSM-8k + Levels 1–5), evaluates all 10 batches via IRT, and adds the best batch (~6 questions). Enforces difficulty diversity by construction rather than hoping for it via random sampling. Primary comparison against Exp 2: does level diversity accelerate convergence to τ > 0.95, and does it do so with fewer total IRT fits? All three methods (Exp 1 random, Exp 2, Exp 3) are plotted on the same τ-vs-questions-added axes.
+
+### Exp 4 — New Model Ranking -- TODO
+Simulates adding an 11th model to an existing benchmark. Uses leave-one-out: hold out model `i`, vary the question budget `k ∈ [10, 25, 50, 100, 200, 300, 500]`, fit IRT on all 10 models with only `k` questions, and measure how accurately the held-out model's rank is recovered. Repeated across all 10 models and 5 seeds per `(model, k)` pair to get stable estimates of rank error.
+
+### Exp 5 — New Question Calibration -- TODO
+Simulates adding a new question to an existing item bank. Holds out one question at a time, varies how many of the 10 models answer it (`k ∈ [2, 3, 4, 5, 6, 8, 10]`), re-fits IRT, and measures MAE of the estimated `b_q` (difficulty) and `a_q` (discrimination) vs. the full-data reference. Identifies the minimum number of model responses needed to reliably characterize a question's psychometric properties.
+
+### Exp 6 — Level-Stratified Sampling -- TODO
+Tests whether the difficulty composition of the question set matters. Uses the pre-existing `level` column (NaN = GSM-8k word problems; Levels 1–5 = Hendrycks MATH) to construct subsets with different level mixes (e.g., GSM-only, Hendrycks-only, hard-only, uniform across levels). Answers: "if you have a fixed question budget, which difficulty levels should you prioritize?"
+
+### Exp 7 — Label Corruption -- TODO
+Deliberately corrupts `judge_result` labels and measures ranking degradation. Tests both random flips (uniform noise) and targeted flips (easy-only, hard-only, or all responses for one model). The per-model inflation/deflation variants identify which models' positions are most sensitive to systematic annotation errors.
+
+### Exp 8 — Hendrycks Category Metadata -- TODO
+Tests whether category-stratified sampling (Algebra, Number Theory, Geometry, etc.) beats level-stratified sampling for a fixed question budget. First checks whether Hendrycks MATH categories can be recovered from `question_id` structure or by matching question text against the public Hendrycks MATH dataset. If feasible, adds a `category` column via `add_hendrycks_metadata.py` and reruns Exp 4-style stratification schemes by category instead of level.
 
 
 ## How to Run
@@ -102,31 +103,28 @@ Improves on Exp 7 by adding questions in level-diverse batches. At each step, co
 python robustness/seed_stability.py --static-csv data/static_10_models.csv
 
 # 1. Random question subsampling
-python robustness/sparsity_random.py \
-    --mode static --sparsity-type questions \
-    --fractions 0.05 0.1 0.2 0.3 0.5 0.7 \
-    --seeds 0 1 2 3 4
+python robustness/sparsity_random.py --mode static --sparsity-type questions --fractions 0.05 0.1 0.2 0.3 0.5 0.7
 
-# 2. New model ranking (Scenario A)
+# 2. Greedy question selection (candidate subsampling, m=50)
+python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy random --hard-cap 150 --candidates 50
+
+# 3. Diversity-batched greedy question selection
+python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy diverse --hard-cap 150 --n-batches 10
+
+# 4. New model ranking
 python robustness/new_model_ranking.py --static-csv data/static_10_models.csv
 
-# 3. New question calibration (Scenario B)
+# 5. New question calibration
 python robustness/new_question_calibration.py --static-csv data/static_10_models.csv
 
-# 4. Level-stratified sampling
+# 6. Level-stratified sampling
 python robustness/sparsity_stratified.py --static-csv data/static_10_models.csv
 
-# 5. Label corruption
+# 7. Label corruption
 python robustness/label_noise.py --static-csv data/static_10_models.csv
 
-# 6. Hendrycks category metadata (stretch — check feasibility first)
+# 8. Hendrycks category metadata (stretch — check feasibility first)
 python robustness/add_hendrycks_metadata.py --static-csv data/static_10_models.csv
-
-# 7. Greedy question selection (candidate subsampling, m=50)
-python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy random --hard-cap 150 --candidates 50 --seeds 0 1 2
-
-# 8. Diversity-batched greedy question selection
-python robustness/greedy_selection.py --static-csv data/static_10_models.csv --strategy diverse --hard-cap 150 --n-batches 10 --seeds 0 1 2
 
 # All results are written to robustness/results/
 ```
