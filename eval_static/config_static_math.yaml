@@ -29,7 +29,18 @@ sampling:
 evaluation:
   sample_file: results/static_eval/math_v0/sampled_items.jsonl
   judge_model: gpt-4.1-mini
-  use_litellm: true
+  use_litellm: false
+  litellm_models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
   output_dir: results/static_eval/math_v0
   save_every: 50
   resume: true
@@ -49,3 +60,7 @@ evaluation:
     - mistral-large-3
     - qwen3-max-thinking
     - llama-4-maverick-instruct
+  generation_timeout: 120
+  generation_max_tokens: 32768
+  generation_retries: 2
+  max_workers: 4

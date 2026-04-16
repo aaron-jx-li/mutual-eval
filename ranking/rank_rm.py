@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-Reward-distilled IRT ranking for static benchmarks + arena reward signals.
+IRT ranking for static benchmarks plus arena reward signals.
 
-This script implements the modified formulation described in the screenshots:
+Supported modes mirror the JSONL-based reward modes in ``ranking.py``:
 
-1. Static benchmark modeling via 2PL-IRT:
+1. ``static``: static 2PL-IRT only
        P(y_{i,q}=1) = sigmoid(a_q * (theta_i - b_q))
 
-2. Arena modeling via reward distillation:
+2. ``arena`` / ``both``: reward-distilled soft-pairwise arena IRT
    - Convert per-response reward scores into globally standardized z-scores.
    - For each question and model pair, define a soft preference target:
        p*_{ijq} = sigmoid(z_{i,q} - z_{j,q})
-
-3. Nested pairwise likelihood:
+   - Fit the nested pairwise likelihood:
        pi_{i,q} = sigmoid(theta_i - b_q)
        P_hat(i > j | q) = sigmoid(gamma * a_q * (pi_{i,q} - pi_{j,q}))
+   - Optionally apply both-bad anchoring when both reward scores are low.
 
-4. Absolute difficulty anchoring:
-   - If both reward scores fall below a threshold tau, apply a both-bad penalty:
-       log(1 - pi_{i,q}) + log(1 - pi_{j,q})
-
-5. Joint optimization with zero-mean identifiability on model abilities.
+3. ``reward`` / ``both-reward``: direct reward-regression IRT
+       r_{i,q} ~= a_q * (theta_i - b_q)
 
 Example:
     python ranking/rank_rm.py --config ranking/config_ranking_rm.yaml
@@ -55,10 +52,56 @@ REPO_ROOT = HERE.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+MODE_TO_ARENA_MODE = {
+    "static": "soft_pairwise",
+    "arena": "soft_pairwise",
+    "both": "soft_pairwise",
+    "reward": "regression",
+    "both-reward": "regression",
+}
+
+
+def mode_uses_static(mode: str) -> bool:
+    return mode in {"static", "both", "both-reward"}
+
+
+def mode_uses_arena(mode: str) -> bool:
+    return mode in {"arena", "both", "reward", "both-reward"}
+
+
+def infer_mode(
+    *,
+    configured_mode: str | None,
+    configured_arena_mode: str | None,
+    has_static_input: bool,
+    has_arena_input: bool,
+) -> str | None:
+    if configured_mode:
+        return configured_mode
+    if configured_arena_mode == "regression":
+        if has_static_input and has_arena_input:
+            return "both-reward"
+        if has_arena_input:
+            return "reward"
+    elif configured_arena_mode == "soft_pairwise":
+        if has_static_input and has_arena_input:
+            return "both"
+        if has_arena_input:
+            return "arena"
+        if has_static_input:
+            return "static"
+    elif has_static_input and has_arena_input:
+        return "both"
+    elif has_arena_input:
+        return "arena"
+    elif has_static_input:
+        return "static"
+    return None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fit reward-distilled IRT rankings from static and arena JSONL files.",
+        description="Fit IRT rankings from static JSONL data and arena reward JSONL data.",
     )
     parser.add_argument(
         "--config",
@@ -76,6 +119,19 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="One or more arena_eval responses.jsonl files with reward scores.",
+    )
+    parser.add_argument(
+        "--mode",
+        default=None,
+        choices=sorted(MODE_TO_ARENA_MODE),
+        help=(
+            "Training mode, aligned with ranking.py. "
+            "'static': static 2PL only. "
+            "'arena': reward-distilled soft-pairwise arena only. "
+            "'both': joint static + reward-distilled arena. "
+            "'reward': direct reward-regression IRT only. "
+            "'both-reward': joint static + direct reward-regression IRT."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -143,6 +199,12 @@ def parse_args() -> argparse.Namespace:
         "--save-pairwise-targets",
         action="store_true",
         help="Write the distilled arena pairwise targets to CSV.",
+    )
+    parser.add_argument(
+        "--arena-mode",
+        default=None,
+        choices=["soft_pairwise", "regression"],
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--no-plot",
@@ -229,6 +291,30 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.both_bad_use_zscore = both_bad_mode != "raw"
         args.both_bad_use_raw = both_bad_mode == "raw"
 
+    if args.mode is None and training.get("mode") is not None:
+        args.mode = str(training.get("mode")).strip().lower()
+    if args.arena_mode is None and training.get("arena_mode") is not None:
+        args.arena_mode = str(training.get("arena_mode")).strip().lower()
+
+    args.mode = infer_mode(
+        configured_mode=args.mode,
+        configured_arena_mode=args.arena_mode,
+        has_static_input=bool(args.static_jsonl),
+        has_arena_input=bool(args.arena_reward_jsonl),
+    )
+    if args.mode is None:
+        args.mode = "both"
+
+    expected_arena_mode = MODE_TO_ARENA_MODE.get(args.mode)
+    if expected_arena_mode is None:
+        valid_modes = ", ".join(sorted(MODE_TO_ARENA_MODE))
+        raise SystemExit(f"Invalid mode '{args.mode}'. Expected one of: {valid_modes}.")
+    if args.arena_mode is not None and args.arena_mode != expected_arena_mode:
+        raise SystemExit(
+            f"Conflicting configuration: mode='{args.mode}' implies arena_mode='{expected_arena_mode}', "
+            f"but arena_mode='{args.arena_mode}' was also provided."
+        )
+    args.arena_mode = expected_arena_mode
     if not args.save_pairwise_targets:
         args.save_pairwise_targets = bool(output.get("save_pairwise_targets", False))
     if not args.no_plot:
@@ -361,7 +447,9 @@ def _get_device() -> torch.device:
 def fit_joint_reward_distilled_irt(
     static_df: pd.DataFrame | None,
     pairwise_df: pd.DataFrame | None,
+    reward_df: pd.DataFrame | None = None,
     *,
+    arena_mode: str = "soft_pairwise",
     num_epochs: int,
     lr: float,
     lambda_static: float,
@@ -370,11 +458,18 @@ def fit_joint_reward_distilled_irt(
     reg_lambda: float,
     verbose: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Fit IRT model jointly from static benchmark and arena reward data.
+
+    arena_mode:
+      'soft_pairwise' — distil rewards into soft pairwise targets (BCE loss).
+      'regression'    — regress a_q*(theta_i - b_q) directly onto raw rewards (MSE loss).
+    """
     static = static_df.copy() if static_df is not None else pd.DataFrame()
-    pairwise = pairwise_df.copy() if pairwise_df is not None else pd.DataFrame()
+    pairwise = pairwise_df.copy() if pairwise_df is not None and arena_mode == "soft_pairwise" else pd.DataFrame()
+    reward = reward_df.copy() if reward_df is not None and arena_mode == "regression" else pd.DataFrame()
 
     has_static = not static.empty
-    has_arena = not pairwise.empty
+    has_arena = not pairwise.empty if arena_mode == "soft_pairwise" else not reward.empty
     if not has_static and not has_arena:
         raise SystemExit("Need at least one non-empty data source.")
 
@@ -385,8 +480,12 @@ def fit_joint_reward_distilled_irt(
         model_series = []
         question_series = []
     if has_arena:
-        model_series.extend([pairwise["model_1"], pairwise["model_2"]])
-        question_series.append(pairwise["question_id"])
+        if arena_mode == "soft_pairwise":
+            model_series.extend([pairwise["model_1"], pairwise["model_2"]])
+            question_series.append(pairwise["question_id"])
+        else:
+            model_series.append(reward["model_name"])
+            question_series.append(reward["question_id"])
 
     all_models = pd.Index(pd.unique(pd.concat(model_series, ignore_index=True)), name="model_name")
     all_questions = pd.Index(pd.unique(pd.concat(question_series, ignore_index=True)), name="question_id")
@@ -403,14 +502,23 @@ def fit_joint_reward_distilled_irt(
         static["m_idx"] = static["model_name"].map(model_to_idx)
         static["q_idx"] = static["question_id"].map(q_to_idx)
     if has_arena:
-        for _, row in pairwise[["question_id", "source", "benchmark"]].drop_duplicates().iterrows():
-            question_meta[str(row["question_id"])] = {
-                "source": str(row["source"]),
-                "benchmark": str(row["benchmark"]),
-            }
-        pairwise["m1_idx"] = pairwise["model_1"].map(model_to_idx)
-        pairwise["m2_idx"] = pairwise["model_2"].map(model_to_idx)
-        pairwise["q_idx"] = pairwise["question_id"].map(q_to_idx)
+        if arena_mode == "soft_pairwise":
+            for _, row in pairwise[["question_id", "source", "benchmark"]].drop_duplicates().iterrows():
+                question_meta[str(row["question_id"])] = {
+                    "source": str(row["source"]),
+                    "benchmark": str(row["benchmark"]),
+                }
+            pairwise["m1_idx"] = pairwise["model_1"].map(model_to_idx)
+            pairwise["m2_idx"] = pairwise["model_2"].map(model_to_idx)
+            pairwise["q_idx"] = pairwise["question_id"].map(q_to_idx)
+        else:
+            for _, row in reward[["question_id", "source", "benchmark"]].drop_duplicates().iterrows():
+                question_meta[str(row["question_id"])] = {
+                    "source": str(row["source"]),
+                    "benchmark": str(row["benchmark"]),
+                }
+            reward["m_idx"] = reward["model_name"].map(model_to_idx)
+            reward["q_idx"] = reward["question_id"].map(q_to_idx)
 
     device = _get_device()
 
@@ -420,9 +528,10 @@ def fit_joint_reward_distilled_irt(
         q_s = torch.tensor(static["q_idx"].values, dtype=torch.long, device=device)
         y_s = torch.tensor(static["judge_result"].values, dtype=torch.float32, device=device)
 
+    # Soft pairwise tensors
     m1_t = m2_t = q_t = soft_t = None
     m1_bb = m2_bb = q_bb = None
-    if has_arena:
+    if has_arena and arena_mode == "soft_pairwise":
         m1_t = torch.tensor(pairwise["m1_idx"].values, dtype=torch.long, device=device)
         m2_t = torch.tensor(pairwise["m2_idx"].values, dtype=torch.long, device=device)
         q_t = torch.tensor(pairwise["q_idx"].values, dtype=torch.long, device=device)
@@ -433,22 +542,32 @@ def fit_joint_reward_distilled_irt(
             m2_bb = torch.tensor(both_bad["m2_idx"].values, dtype=torch.long, device=device)
             q_bb = torch.tensor(both_bad["q_idx"].values, dtype=torch.long, device=device)
 
+    # Regression tensors
+    m_r = q_r = r_t = None
+    if has_arena and arena_mode == "regression":
+        m_r = torch.tensor(reward["m_idx"].values, dtype=torch.long, device=device)
+        q_r = torch.tensor(reward["q_idx"].values, dtype=torch.long, device=device)
+        r_t = torch.tensor(reward["reward_raw"].values, dtype=torch.float32, device=device)
+
     n_models = len(all_models)
     n_questions = len(all_questions)
 
     theta = nn.Embedding(n_models, 1, device=device)
     b = nn.Embedding(n_questions, 1, device=device)
     k = nn.Embedding(n_questions, 1, device=device)
-    log_gamma = nn.Parameter(torch.tensor(0.0, device=device))
     nn.init.zeros_(theta.weight)
     nn.init.zeros_(b.weight)
     nn.init.zeros_(k.weight)
 
-    optimizer = optim.Adam(
-        [*theta.parameters(), *b.parameters(), *k.parameters(), log_gamma],
-        lr=lr,
-    )
+    # log_gamma is only used in soft_pairwise mode
+    log_gamma = nn.Parameter(torch.tensor(0.0, device=device))
+    opt_params = [*theta.parameters(), *b.parameters(), *k.parameters()]
+    if arena_mode == "soft_pairwise":
+        opt_params.append(log_gamma)
+
+    optimizer = optim.Adam(opt_params, lr=lr)
     bce_logits = nn.BCEWithLogitsLoss()
+    mse = nn.MSELoss()
 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -462,7 +581,7 @@ def fit_joint_reward_distilled_irt(
             loss_static = bce_logits(logits_s, y_s)
 
         loss_arena = torch.tensor(0.0, device=device)
-        if has_arena and m1_t is not None and len(m1_t):
+        if has_arena and arena_mode == "soft_pairwise" and m1_t is not None and len(m1_t):
             theta_1 = theta(m1_t).squeeze(-1)
             theta_2 = theta(m2_t).squeeze(-1)
             b_q = b(q_t).squeeze(-1)
@@ -473,9 +592,15 @@ def fit_joint_reward_distilled_irt(
             pi_2 = torch.sigmoid(theta_2 - b_q)
             arena_logits = gamma * a_q * (pi_1 - pi_2)
             loss_arena = bce_logits(arena_logits, soft_t)
+        elif has_arena and arena_mode == "regression" and m_r is not None and len(m_r):
+            theta_r = theta(m_r).squeeze(-1)
+            b_r = b(q_r).squeeze(-1)
+            k_r = k(q_r).squeeze(-1)
+            pred = torch.exp(k_r) * (theta_r - b_r)
+            loss_arena = mse(pred, r_t)
 
         loss_bb = torch.tensor(0.0, device=device)
-        if has_arena and m1_bb is not None and len(m1_bb):
+        if has_arena and arena_mode == "soft_pairwise" and m1_bb is not None and len(m1_bb):
             theta_1_bb = theta(m1_bb).squeeze(-1)
             theta_2_bb = theta(m2_bb).squeeze(-1)
             b_q_bb = b(q_bb).squeeze(-1)
@@ -490,8 +615,9 @@ def fit_joint_reward_distilled_irt(
             theta.weight.pow(2).mean()
             + b.weight.pow(2).mean()
             + k.weight.pow(2).mean()
-            + log_gamma.pow(2)
         )
+        if arena_mode == "soft_pairwise":
+            reg = reg + reg_lambda * log_gamma.pow(2)
         total = lambda_static * loss_static + lambda_arena * loss_arena + lambda_bb * loss_bb + reg
         total.backward()
         optimizer.step()
@@ -502,19 +628,27 @@ def fit_joint_reward_distilled_irt(
             b.weight.sub_(shift)
 
         if verbose and (epoch % 500 == 0 or epoch == num_epochs - 1):
-            print(
-                f"  Epoch {epoch:5d} | "
-                f"static={loss_static.item():.4f}  "
-                f"arena={loss_arena.item():.4f}  "
-                f"bb={loss_bb.item():.4f}  "
-                f"gamma={torch.exp(log_gamma).item():.4f}  "
-                f"total={total.item():.4f}"
-            )
+            if arena_mode == "soft_pairwise":
+                print(
+                    f"  Epoch {epoch:5d} | "
+                    f"static={loss_static.item():.4f}  "
+                    f"arena={loss_arena.item():.4f}  "
+                    f"bb={loss_bb.item():.4f}  "
+                    f"gamma={torch.exp(log_gamma).item():.4f}  "
+                    f"total={total.item():.4f}"
+                )
+            else:
+                print(
+                    f"  Epoch {epoch:5d} | "
+                    f"static={loss_static.item():.4f}  "
+                    f"reward_mse={loss_arena.item():.4f}  "
+                    f"total={total.item():.4f}"
+                )
 
     theta_np = theta.weight.detach().cpu().numpy().squeeze(-1)
     b_np = b.weight.detach().cpu().numpy().squeeze(-1)
     k_np = k.weight.detach().cpu().numpy().squeeze(-1)
-    gamma_np = float(torch.exp(log_gamma).detach().cpu().item())
+    gamma_np = float(torch.exp(log_gamma).detach().cpu().item()) if arena_mode == "soft_pairwise" else None
 
     model_params = (
         pd.DataFrame({"model_name": all_models, "theta": theta_np})
@@ -542,6 +676,7 @@ def fit_joint_reward_distilled_irt(
     )
 
     metadata = {
+        "arena_mode": arena_mode,
         "learned_gamma": gamma_np,
         "n_models": int(n_models),
         "n_questions": int(n_questions),
@@ -557,7 +692,9 @@ def compute_metrics(
     model_params: pd.DataFrame,
     question_params: pd.DataFrame,
     *,
-    learned_gamma: float,
+    arena_mode: str = "soft_pairwise",
+    learned_gamma: float | None = None,
+    reward_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     theta_map = model_params.set_index("model_name")["theta"]
     question_map = question_params.set_index("question_id")[["difficulty_b", "discrimination_exp_k"]]
@@ -573,7 +710,7 @@ def compute_metrics(
         st["pred_correct"] = (logits >= 0).astype(int)
         metrics["static_accuracy"] = float((st["pred_correct"] == st["judge_result"].astype(int)).mean())
 
-    if pairwise_df is not None and not pairwise_df.empty:
+    if arena_mode == "soft_pairwise" and pairwise_df is not None and not pairwise_df.empty:
         ar = pairwise_df.copy()
         ar["theta_1"] = ar["model_1"].map(theta_map)
         ar["theta_2"] = ar["model_2"].map(theta_map)
@@ -582,7 +719,8 @@ def compute_metrics(
         ar = ar.dropna(subset=["theta_1", "theta_2", "difficulty_b", "a_q"])
         pi1 = 1.0 / (1.0 + np.exp(-(ar["theta_1"] - ar["difficulty_b"])))
         pi2 = 1.0 / (1.0 + np.exp(-(ar["theta_2"] - ar["difficulty_b"])))
-        logits = learned_gamma * ar["a_q"].to_numpy() * (pi1 - pi2)
+        gamma = learned_gamma if learned_gamma is not None else 1.0
+        logits = gamma * ar["a_q"].to_numpy() * (pi1 - pi2)
         pred_prob = 1.0 / (1.0 + np.exp(-logits))
         target = ar["target_prob"].to_numpy()
         eps = 1e-6
@@ -599,6 +737,17 @@ def compute_metrics(
             )
         else:
             metrics["arena_hard_pair_accuracy"] = float("nan")
+
+    elif arena_mode == "regression" and reward_df is not None and not reward_df.empty:
+        rw = reward_df.copy()
+        rw["theta"] = rw["model_name"].map(theta_map)
+        rw["difficulty_b"] = rw["question_id"].map(question_map["difficulty_b"])
+        rw["a_q"] = rw["question_id"].map(question_map["discrimination_exp_k"])
+        rw = rw.dropna(subset=["theta", "difficulty_b", "a_q"])
+        pred = rw["a_q"] * (rw["theta"] - rw["difficulty_b"])
+        residuals = pred - rw["reward_raw"]
+        metrics["arena_reward_mse"] = float((residuals ** 2).mean())
+        metrics["arena_reward_mae"] = float(residuals.abs().mean())
 
     return metrics
 
@@ -618,7 +767,7 @@ def plot_difficulty_and_ability(
     benchmarks = sorted(qr["benchmark"].fillna("unknown").unique())
     colors = plt.cm.tab10.colors[: max(1, len(benchmarks))]
 
-    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig, ax = plt.subplots(figsize=(12, 5.5))
     bins = np.linspace(qr["difficulty_b"].min(), qr["difficulty_b"].max(), 41)
     centers = (bins[:-1] + bins[1:]) / 2
     widths = np.diff(bins)
@@ -678,27 +827,38 @@ def plot_difficulty_and_ability(
     ax.set_ylabel("Number of questions")
     ax.set_title(title)
 
+    # Place both legends side-by-side below the axes.
+    # ncol=2 for models keeps the block compact when there are many models.
+    # bbox_inches='tight' at save time ensures they are not clipped.
+    n_model_cols = 2 if len(model_handles) > 8 else 1
     benchmark_legend = ax.legend(
         handles=benchmark_handles,
         title="Question Sources",
-        frameon=False,
-        bbox_to_anchor=(1.02, 1.0),
+        frameon=True,
+        framealpha=0.9,
         loc="upper left",
+        bbox_to_anchor=(0.0, -0.14),
+        bbox_transform=ax.transAxes,
         borderaxespad=0.0,
+        fontsize=8,
+        title_fontsize=9,
     )
     ax.add_artist(benchmark_legend)
     ax.legend(
         handles=model_handles,
         title="Model Rankings",
-        frameon=False,
-        bbox_to_anchor=(1.02, 0.55),
+        frameon=True,
+        framealpha=0.9,
         loc="upper left",
+        bbox_to_anchor=(0.42, -0.14),
+        bbox_transform=ax.transAxes,
         borderaxespad=0.0,
+        ncol=n_model_cols,
         fontsize=8,
         title_fontsize=9,
     )
 
-    plt.tight_layout(rect=[0, 0, 0.82, 1])
+    plt.tight_layout()
     save_path_obj = Path(save_path)
     save_path_obj.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path_obj, dpi=500, bbox_inches="tight")
@@ -719,8 +879,13 @@ def main() -> None:
     if args.both_bad_use_zscore and args.both_bad_use_raw:
         raise SystemExit("Choose only one of --both-bad-use-zscore or --both-bad-use-raw.")
 
+    use_static = mode_uses_static(args.mode)
+    use_arena = mode_uses_arena(args.mode)
+
     static_df = pd.DataFrame()
-    if args.static_jsonl:
+    if use_static:
+        if not args.static_jsonl:
+            raise SystemExit(f"Mode '{args.mode}' requires --static-jsonl.")
         print(f"Loading static JSONL files: {len(args.static_jsonl)}")
         static_df = load_static_jsonl(args.static_jsonl)
         print(
@@ -728,10 +893,14 @@ def main() -> None:
             f"{static_df['model_name'].nunique() if not static_df.empty else 0} models, "
             f"{static_df['question_id'].nunique() if not static_df.empty else 0} questions"
         )
+    elif args.static_jsonl:
+        print(f"Note: ignoring static_jsonl because mode='{args.mode}' does not use static data.")
 
     reward_df = pd.DataFrame()
     pairwise_df = pd.DataFrame()
-    if args.arena_reward_jsonl:
+    if use_arena:
+        if not args.arena_reward_jsonl:
+            raise SystemExit(f"Mode '{args.mode}' requires --arena-reward-jsonl.")
         print(f"Loading arena reward JSONL files: {len(args.arena_reward_jsonl)}")
         reward_df = load_arena_reward_jsonl(args.arena_reward_jsonl)
         if reward_df.empty:
@@ -744,23 +913,31 @@ def main() -> None:
                 f"reward mean={reward_df['reward_raw'].mean():.3f}, "
                 f"reward std={reward_df['reward_raw'].std(ddof=0):.3f}"
             )
-            pairwise_df = build_soft_pairwise_targets(
-                reward_df,
-                both_bad_threshold=args.both_bad_threshold,
-                both_bad_use_zscore=args.both_bad_use_zscore,
-            )
-            print(
-                f"  distilled into {len(pairwise_df)} soft pairwise rows; "
-                f"both_bad={int(pairwise_df['both_bad'].sum()) if not pairwise_df.empty else 0}"
-            )
+            if args.arena_mode == "soft_pairwise":
+                pairwise_df = build_soft_pairwise_targets(
+                    reward_df,
+                    both_bad_threshold=args.both_bad_threshold,
+                    both_bad_use_zscore=args.both_bad_use_zscore,
+                )
+                print(
+                    f"  distilled into {len(pairwise_df)} soft pairwise rows; "
+                    f"both_bad={int(pairwise_df['both_bad'].sum()) if not pairwise_df.empty else 0}"
+                )
+            else:
+                print(f"  arena_mode=regression: using raw rewards directly")
+    elif args.arena_reward_jsonl:
+        print(f"Note: ignoring arena_reward_jsonl because mode='{args.mode}' does not use arena reward data.")
 
-    if static_df.empty and pairwise_df.empty:
+    has_arena_data = (not pairwise_df.empty) if args.arena_mode == "soft_pairwise" else (not reward_df.empty)
+    if static_df.empty and not has_arena_data:
         raise SystemExit("No usable static or arena-reward data loaded.")
 
-    print("\nFitting reward-distilled IRT model ...")
+    print(f"\nFitting IRT model (mode={args.mode}, arena_mode={args.arena_mode}) ...")
     model_params, question_params, fit_meta = fit_joint_reward_distilled_irt(
         static_df if not static_df.empty else None,
         pairwise_df if not pairwise_df.empty else None,
+        reward_df if not reward_df.empty else None,
+        arena_mode=args.arena_mode,
         num_epochs=args.num_epochs,
         lr=args.lr,
         lambda_static=args.lambda_static,
@@ -775,7 +952,9 @@ def main() -> None:
         pairwise_df if not pairwise_df.empty else None,
         model_params,
         question_params,
-        learned_gamma=float(fit_meta["learned_gamma"]),
+        arena_mode=args.arena_mode,
+        learned_gamma=fit_meta["learned_gamma"],
+        reward_df=reward_df if not reward_df.empty else None,
     )
 
     output_dir = Path(args.output_dir)
@@ -787,6 +966,8 @@ def main() -> None:
 
     run_summary = {
         "config": args.config,
+        "mode": args.mode,
+        "arena_mode": args.arena_mode,
         "static_jsonl": args.static_jsonl,
         "arena_reward_jsonl": args.arena_reward_jsonl,
         "num_epochs": args.num_epochs,
@@ -810,14 +991,21 @@ def main() -> None:
     print("\nMetrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value}")
-    print(f"  learned_gamma: {fit_meta['learned_gamma']}")
+    if fit_meta["learned_gamma"] is not None:
+        print(f"  learned_gamma: {fit_meta['learned_gamma']}")
 
     if not args.no_plot and args.save_plot:
+        if args.mode == "static":
+            title = "Static IRT Ranking"
+        elif args.arena_mode == "soft_pairwise":
+            title = "Reward-Distilled IRT Ranking"
+        else:
+            title = "Reward Regression IRT Ranking"
         plot_difficulty_and_ability(
             model_params,
             question_params,
             save_path=args.save_plot,
-            title="Reward-Distilled IRT Ranking",
+            title=title,
         )
         print(f"\nSaved plot to {args.save_plot}")
 
