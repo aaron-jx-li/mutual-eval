@@ -11,8 +11,8 @@ claude-haiku-4-5,math-prealgebra,15,15,14,0.9333333333333333,15,0
 claude-haiku-4-5,math-precalculus,15,15,14,0.9333333333333333,15,0
 claude-haiku-4-5,mmlu-abstract,20,20,19,0.95,20,0
 claude-haiku-4-5,mmlu-college,20,20,20,1,20,0
-claude-haiku-4-5,olympiad-math,80,80,56,0.7,80,0
-claude-opus-4-6,aime-2025,30,30,18,0.6,30,0
+claude-haiku-4-5,olympiad-math,80,80,58,0.725,80,0
+claude-opus-4-6,aime-2025,30,30,20,0.6666666666666666,30,0
 claude-opus-4-6,aime-2026,30,30,19,0.6333333333333333,30,0
 claude-opus-4-6,gsm8k,50,50,49,0.98,50,0
 claude-opus-4-6,math-algebra,35,35,35,1,35,0
@@ -24,9 +24,9 @@ claude-opus-4-6,math-prealgebra,15,15,15,1,15,0
 claude-opus-4-6,math-precalculus,15,15,14,0.9333333333333333,15,0
 claude-opus-4-6,mmlu-abstract,20,20,20,1,20,0
 claude-opus-4-6,mmlu-college,20,20,20,1,20,0
-claude-opus-4-6,olympiad-math,80,80,66,0.825,80,0
+claude-opus-4-6,olympiad-math,80,80,68,0.85,80,0
 claude-sonnet-4-6,aime-2025,30,30,17,0.5666666666666667,30,0
-claude-sonnet-4-6,aime-2026,30,30,20,0.6666666666666666,30,0
+claude-sonnet-4-6,aime-2026,30,30,22,0.7333333333333333,30,0
 claude-sonnet-4-6,gsm8k,50,50,49,0.98,50,0
 claude-sonnet-4-6,math-algebra,35,35,35,1,35,0
 claude-sonnet-4-6,math-counting,50,50,49,0.98,50,0
@@ -37,7 +37,7 @@ claude-sonnet-4-6,math-prealgebra,15,15,15,1,15,0
 claude-sonnet-4-6,math-precalculus,15,15,14,0.9333333333333333,15,0
 claude-sonnet-4-6,mmlu-abstract,20,20,20,1,20,0
 claude-sonnet-4-6,mmlu-college,20,20,19,0.95,20,0
-claude-sonnet-4-6,olympiad-math,80,80,66,0.825,80,0
+claude-sonnet-4-6,olympiad-math,80,80,67,0.8375,80,0
 deepseek-v3.2,aime-2025,30,30,17,0.5666666666666667,30,0
 deepseek-v3.2,aime-2026,30,30,22,0.7333333333333333,30,0
 deepseek-v3.2,gsm8k,50,50,48,0.96,50,0
@@ -129,8 +129,8 @@ gpt-5-mini,math-precalculus,15,15,14,0.9333333333333333,15,0
 gpt-5-mini,mmlu-abstract,20,20,20,1,20,0
 gpt-5-mini,mmlu-college,20,20,20,1,20,0
 gpt-5-mini,olympiad-math,80,80,66,0.825,78,2
-gpt-5.4,aime-2025,30,30,18,0.6,30,0
-gpt-5.4,aime-2026,30,30,24,0.8,30,0
+gpt-5.4,aime-2025,30,30,19,0.6333333333333333,30,0
+gpt-5.4,aime-2026,30,30,22,0.7333333333333333,30,0
 gpt-5.4,gsm8k,50,50,49,0.98,50,0
 gpt-5.4,math-algebra,35,35,34,0.9714285714285714,35,0
 gpt-5.4,math-counting,50,50,49,0.98,50,0

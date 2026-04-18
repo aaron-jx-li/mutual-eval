@@ -30,17 +30,17 @@ evaluation:
   sample_file: results/static_eval/math_v0/sampled_items.jsonl
   judge_model: gpt-4.1-mini
   use_litellm: false
-  litellm_models:
-    - gpt-5.4
-    - gpt-5-mini
-    - gpt-4.1
-    - gpt-4.1-mini
-    - claude-opus-4-6
-    - claude-sonnet-4-6
-    - claude-haiku-4-5
-    - gemini-3.1-pro
-    - gemini-2.5-pro
-    - gemini-2.5-flash
+  litellm_models: []
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
   output_dir: results/static_eval/math_v0
   save_every: 50
   resume: true
@@ -61,6 +61,9 @@ evaluation:
     - qwen3-max-thinking
     - llama-4-maverick-instruct
   generation_timeout: 120
-  generation_max_tokens: 32768
+  # Match Gemini 2.5/3.1 cap in eval_static_math.py (65536); revert to 32768 if you want the old default.
+  generation_max_tokens: 65536
   generation_retries: 2
+  model_max_tokens:
+    claude-haiku-4-5: 56000  # haiku-4-5-20251001 API cap is 64000, below the global 65536
   max_workers: 4
