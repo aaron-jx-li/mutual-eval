@@ -1,0 +1,24 @@
+{
+  "dataset": "lmarena-ai/arena-human-preference-140k",
+  "split": "train",
+  "allowed_languages": [
+    "en"
+  ],
+  "judge_model": "gpt-4.1-mini",
+  "min_confidence": 0.8,
+  "seed": 42,
+  "domain_label_pre_filter": {
+    "excluded_coding": 24366,
+    "excluded_math": 4018,
+    "excluded_short_prompt": 30166,
+    "candidates_after_filter": 12625
+  },
+  "judged": 12625,
+  "accepted": 1914,
+  "selected": 1000,
+  "target": 1000,
+  "judge_errors": 0,
+  "output": "data/v1_generic_1000.jsonl",
+  "judged_log": "data/v1_generic_1000_judged.jsonl",
+  "checkpoint": "data/v1_generic_1000_checkpoint.json"
+}
