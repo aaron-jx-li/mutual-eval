@@ -164,6 +164,8 @@ DATASET_SPECS: list[DatasetSpec] = [
     DatasetSpec("aime-2025", "test-time-compute/aime_2025", None, "test", "aime", 5, 30),
     DatasetSpec("aime-2026", "MathArena/aime_2026", None, "train", "aime", 5, 30),
     DatasetSpec("olympiad-math", "math-ai/olympiadbench", None, "test", "olympiad", 10, 80),
+    # HLE (Humanity's Last Exam) — text-only math subset
+    DatasetSpec("hle-math", "cais/hle", None, "test", "hle", 10, 60),
 ]
 
 DATASET_LOOKUP = {spec.name: spec for spec in DATASET_SPECS}
@@ -441,6 +443,7 @@ def build_clients(selected_models: list[str], generation_timeout: int) -> dict[s
 
     if "openai" not in clients:
         sys.exit("OPENAI_API_KEY is required for the judge model.")
+    clients["_generation_timeout"] = generation_timeout
     return clients
 
 
@@ -488,6 +491,16 @@ def load_raw_rows(spec: DatasetSpec) -> list[dict]:
             and row.get("language") == "English"
             and row.get("modality") == "Text-only"
             and not row.get("is_multiple_answer", False)
+        ]
+    if spec.kind == "hle":
+        # Filter to math questions and sanitize each row.
+        # HF materialises all Image features as PngImageFile objects (including
+        # fields we don't know about), so we recursively strip any value that
+        # isn't a JSON primitive rather than trying to name specific keys.
+        rows = [
+            _sanitize_for_json(row)
+            for row in rows
+            if "math" in str(row.get("category", "")).lower()
         ]
     return rows
 
@@ -546,6 +559,8 @@ def build_raw_question(dataset_spec: DatasetSpec, item: dict) -> str:
         return item.get("question") or item.get("problem")
     if dataset_spec.kind == "olympiad":
         return item["question"]
+    if dataset_spec.kind == "hle":
+        return item["question"]
     return item["problem"]
 
 
@@ -563,6 +578,8 @@ def build_gold_answer(dataset_spec: DatasetSpec, item: dict) -> str:
         if isinstance(final_answer, list):
             return " ; ".join(str(part) for part in final_answer)
         return str(final_answer)
+    if dataset_spec.kind == "hle":
+        return str(item["answer"])
     return item["solution"]
 
 
@@ -584,6 +601,8 @@ def get_item_metadata(dataset_spec: DatasetSpec, item: dict) -> dict[str, Any]:
             "level": item.get("difficulty", "Competition"),
             "subject": item.get("subfield") or item.get("subject") or "Olympiad",
         }
+    if dataset_spec.kind == "hle":
+        return {"level": "Expert", "subject": item.get("category", "Mathematics")}
     return {"level": item.get("level"), "subject": item.get("type")}
 
 
@@ -681,13 +700,22 @@ def call_model(
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
-        return call_openai_compatible(
-            clients["google"],
-            spec.model_id,
-            user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=google_max_tokens,
-        )
+        # Google's API sends HTTP keepalives while thinking, which resets the
+        # httpx read timeout. Enforce a hard wall-clock timeout via a thread.
+        _generation_timeout = clients.get("_generation_timeout")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(
+                call_openai_compatible,
+                clients["google"],
+                spec.model_id,
+                user_prompt=prompt,
+                temperature=0.0,
+                max_tokens=google_max_tokens,
+            )
+            try:
+                return _fut.result(timeout=_generation_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Request timed out after {_generation_timeout}s.")
     if spec.provider == "openrouter":
         return call_openai_compatible(
             clients["openrouter"],
@@ -706,6 +734,17 @@ def call_model(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
     raise ValueError(f"Unsupported provider: {spec.provider}")
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively replace any non-JSON-serializable value (e.g. PIL Images) with None."""
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return None
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:

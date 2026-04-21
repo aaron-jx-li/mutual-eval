@@ -25,33 +25,44 @@ sampling:
 
 evaluation:
   input_file: data/arena_expert_5k_coding.jsonl
-  first_k: 500
-  output_dir: results/arena_eval/coding_v0
-  openai_base_url: https://api.openai.com/v1
+  first_k: 350
+  output_dir: results/arena_eval/coding_v1
+  openai_base_url: ${OPENAI_BASE_URL}
   # Optional explicit direct OpenAI endpoint for GPT models.
   # Example: https://api.openai.com/v1 or https://us.api.openai.com/v1
-  # openai_base_url: https://api.openai.com/v1
   # If true, route every model with a LiteLLM mapping through LiteLLM.
   # Leave false to use the default/native routing unless litellm_models is set.
   use_litellm: false
   # Optional explicit subset of model labels to route through LiteLLM.
   # This overrides the default Claude-only LiteLLM routing in eval_arena_coding.py.
-  litellm_models: []
+  litellm_models: 
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
     # - claude-opus-4-6
     # - claude-sonnet-4-6
     # - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+
   # When resuming, retry prior failed rows with these statuses.
   retry_statuses:
     - generation_error
     - reward_error
-  save_every: 100
+  save_every: 50
   resume: true
-  max_workers: 8
-  generation_timeout: 120
-  generation_max_tokens: 32768
+  max_workers: 4
+  generation_timeout: 300
+  # Same global budget as eval_static/config_static_math.yaml; Haiku is capped separately (below).
+  generation_max_tokens: 65536
   model_max_tokens:
+    claude-haiku-4-5: 56000  # haiku-4-5-20251001 API max output is 64000, below the 65536 global
     gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
     gpt-5.4: ~       # thinking model: exhausts 16384 on hard problems
+    gpt-4.1: 32768
+    gpt-4.1-mini: 32768
   reward_timeout: 300
   reward_max_concurrency: 8
   rm_base_url: ${ARENA_RM_BASE_URL}

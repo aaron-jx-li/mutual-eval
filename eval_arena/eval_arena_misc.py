@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Static-style Arena generic evaluation with reward-model scoring.
+Static-style Arena misc evaluation with reward-model scoring.
 
-For each generic Arena prompt (from arena_140k_generic.jsonl), this script:
+For each misc Arena prompt (from v1_misc_300.jsonl), this script:
 1. Generates one answer from each selected model.
 2. Scores each generated answer with the reward model.
 3. Writes one result row per `(question, model)` evaluation.
 
-Config supports first_k to limit evaluation to the first k items (default: 500).
-
 Example:
-  python eval_arena/eval_arena_generic.py --config eval_arena/config_arena_generic.yaml
+  python eval_arena/eval_arena_misc.py --config eval_arena/config_arena_misc.yaml
 """
 
 from __future__ import annotations
@@ -62,7 +60,7 @@ ANSWER_INSTRUCTION = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate selected models on Arena generic prompts with a reward model.",
+        description="Evaluate selected models on Arena misc prompts with a reward model.",
     )
     parser.add_argument(
         "--config",
@@ -72,14 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-file",
         default=None,
-        help="Arena generic input file (JSONL from arena_140k_generic).",
-    )
-    parser.add_argument(
-        "--first-k",
-        type=int,
-        default=None,
-        dest="first_k",
-        help="Use only first k items (default from config: 500).",
+        help="Arena misc input file (JSONL).",
     )
     parser.add_argument(
         "--models",
@@ -215,13 +206,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     section = config.get("evaluation", {})
 
     if args.input_file is None:
-        args.input_file = section.get("input_file", "data/v1_generic_1000.jsonl")
-    if args.first_k is None:
-        args.first_k = int(section.get("first_k", 500))
+        args.input_file = section.get("input_file", "data/v1_misc_300.jsonl")
     if args.models is None:
         args.models = section.get("models", list(DEFAULT_MODELS))
     if args.output_dir is None:
-        args.output_dir = section.get("output_dir", "results/arena_eval/generic_v1")
+        args.output_dir = section.get("output_dir", "results/arena_eval/misc_v1")
     if args.rm_base_url is None:
         args.rm_base_url = section.get("rm_base_url")
     if args.rm_token is None:
@@ -290,13 +279,13 @@ def load_input_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def build_question_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build items from arena generic rows. Uses 'prompt' field as the question."""
+    """Build items from arena misc rows. Uses 'prompt' field as the question."""
     items: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         question = str(row.get("prompt") or row.get("question") or "").strip()
         if not question:
             continue
-        item_id = str(row.get("id") or f"arena_generic_{row_index:06d}")
+        item_id = str(row.get("id") or f"arena_misc_{row_index:06d}")
         items.append(
             {
                 "item_id": item_id,
@@ -854,8 +843,6 @@ def main() -> None:
         raise SystemExit("--save-every must be at least 1.")
     if args.reward_max_concurrency < 1:
         raise SystemExit("--reward-max-concurrency must be at least 1.")
-    if args.first_k < 1:
-        raise SystemExit("--first-k must be at least 1.")
     if args.generation_max_tokens < 1:
         raise SystemExit("--generation-max-tokens must be at least 1.")
     if args.litellm_models is not None:
@@ -896,7 +883,6 @@ def main() -> None:
     reward_semaphore = threading.BoundedSemaphore(value=min(args.reward_max_concurrency, 8))
 
     raw_rows = load_input_rows(input_path)
-    raw_rows = raw_rows[: args.first_k]
     items = build_question_items(raw_rows)
 
     eval_order_lookup = build_eval_order_lookup(items, selected_model_specs)
@@ -931,7 +917,6 @@ def main() -> None:
         "openai_base_url": resolved_openai_base_url,
         "litellm_base_url": resolved_litellm_base_url,
         "retry_statuses": sorted(retry_statuses),
-        "first_k": args.first_k,
         "rm_base_url": rm_base_url,
         "total_items": len(items),
         "total_evals": total_evals,
@@ -946,7 +931,7 @@ def main() -> None:
     progress = tqdm(
         total=total_evals,
         initial=completed_evals,
-        desc="Evaluating Arena generic",
+        desc="Evaluating Arena misc",
         unit="eval",
     )
 

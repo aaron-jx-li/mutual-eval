@@ -173,14 +173,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        default=False,
+        help="When resuming, treat all errored rows as completed and skip them.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from an existing responses.jsonl in the output directory.",
     )
-    args = parser.parse_args()
-    if not hasattr(args, "model_max_tokens"):
-        args.model_max_tokens = None
-    return args
+    return parser.parse_args()
 
 
 def resolve_env_path() -> Path:
@@ -234,9 +237,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     if args.generation_max_tokens is None:
         cfg_val = section.get("generation_max_tokens")
         args.generation_max_tokens = int(cfg_val) if cfg_val is not None else None
-    if not hasattr(args, "model_max_tokens") or args.model_max_tokens is None:
-        raw = section.get("model_max_tokens") or {}
-        args.model_max_tokens = {k: (int(v) if v is not None else None) for k, v in raw.items()}
+    # Mirror eval_static_math.py: always merge model_max_tokens from config (per-model ceilings).
+    args.model_max_tokens = {
+        key: (int(value) if value is not None else None)
+        for key, value in section.get("model_max_tokens", {}).items()
+    }
     if args.reward_timeout is None:
         args.reward_timeout = int(section.get("reward_timeout", 300))
     if args.reward_max_concurrency is None:
@@ -247,6 +252,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.litellm_models = list(section.get("litellm_models", []))
     if args.retry_statuses is None:
         args.retry_statuses = list(section.get("retry_statuses", ["generation_error"]))
+    if args.no_retry:
+        args.retry_statuses = []
     if not args.resume:
         args.resume = bool(section.get("resume", False))
     return args
@@ -485,6 +492,7 @@ def build_clients(
         missing.append("openrouter")
     if missing:
         raise SystemExit(f"Missing API credentials/config for providers: {', '.join(sorted(set(missing)))}")
+    clients["_generation_timeout"] = generation_timeout
     return clients
 
 
@@ -557,13 +565,20 @@ def call_model(
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
-        return call_openai_compatible(
-            clients["google"],
-            spec.model_id,
-            user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=google_max_tokens,
-        )
+        _timeout = clients.get("_generation_timeout")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(
+                call_openai_compatible,
+                clients["google"],
+                spec.model_id,
+                user_prompt=prompt,
+                temperature=0.0,
+                max_tokens=google_max_tokens,
+            )
+            try:
+                return _fut.result(timeout=_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Request timed out after {_timeout}s.")
     if spec.provider == "openrouter":
         return call_openai_compatible(
             clients["openrouter"],
@@ -921,6 +936,7 @@ def main() -> None:
         "max_workers": args.max_workers,
         "generation_timeout": args.generation_timeout,
         "generation_max_tokens": args.generation_max_tokens,
+        "model_max_tokens": args.model_max_tokens,
         "reward_timeout": args.reward_timeout,
         "reward_max_concurrency": min(args.reward_max_concurrency, 8),
         "use_litellm": args.use_litellm,

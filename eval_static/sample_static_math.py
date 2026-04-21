@@ -32,6 +32,7 @@ from eval_static_math import (
     build_sample_plan,
     get_item_metadata,
     load_env_file,
+    load_jsonl,
     load_raw_rows,
     sample_rows,
     write_jsonl,
@@ -120,6 +121,13 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.seed = int(section.get("seed", 0))
     if args.output_dir is None:
         args.output_dir = section.get("output_dir")
+
+    # copy_from: datasets to copy verbatim from an existing sampled_items.jsonl
+    copy_from = section.get("copy_from", {})
+    args.copy_from_file = copy_from.get("file")
+    args.copy_from_datasets = list(copy_from.get("datasets", []))
+    args.copy_from_responses_file = copy_from.get("responses_file")
+
     return args
 
 
@@ -138,9 +146,28 @@ def main() -> None:
     output_dir = build_output_dir(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Copy items from an existing sampled_items.jsonl (e.g. v0) ---
+    copied_items: list[dict[str, Any]] = []
+    if args.copy_from_file and args.copy_from_datasets:
+        copy_path = Path(args.copy_from_file)
+        if not copy_path.exists():
+            raise FileNotFoundError(f"copy_from file not found: {copy_path}")
+        copy_ds = set(args.copy_from_datasets)
+        all_v0 = load_jsonl(copy_path)
+        copied_items = [item for item in all_v0 if item.get("dataset") in copy_ds]
+        found_ds = {item["dataset"] for item in copied_items}
+        missing = copy_ds - found_ds
+        if missing:
+            raise ValueError(f"copy_from datasets not found in {copy_path}: {missing}")
+        print(
+            f"Copied {len(copied_items)} items from {copy_path} "
+            f"({', '.join(sorted(found_ds))})"
+        )
+
+    # --- Sample fresh datasets ---
     sample_plan = build_sample_plan(args.datasets, args.profile, args.samples_per_dataset)
 
-    sampled_items: list[dict[str, Any]] = []
+    fresh_items: list[dict[str, Any]] = []
     dataset_progress = tqdm(args.datasets, desc="Sampling datasets", unit="dataset")
     for dataset_name in dataset_progress:
         spec = DATASET_LOOKUP[dataset_name]
@@ -162,7 +189,7 @@ def main() -> None:
 
         for idx, item in enumerate(sampled_rows):
             metadata = get_item_metadata(spec, item)
-            sampled_items.append(
+            fresh_items.append(
                 {
                     "dataset": dataset_name,
                     "dataset_kind": spec.kind,
@@ -176,22 +203,45 @@ def main() -> None:
             )
     dataset_progress.close()
 
-    write_jsonl(output_dir / "sampled_items.jsonl", sampled_items)
+    # Copied items come first so aime/olympiad appear before hle-math
+    all_items = copied_items + fresh_items
+    write_jsonl(output_dir / "sampled_items.jsonl", all_items)
+
+    # --- Copy responses for --resume support ---
+    # Pre-populate responses.jsonl with already-evaluated records so that
+    # eval_static_math.py --resume skips them without re-running.
+    if args.copy_from_responses_file and args.copy_from_datasets:
+        resp_path = Path(args.copy_from_responses_file)
+        if not resp_path.exists():
+            print(f"Warning: copy_from responses_file not found, skipping: {resp_path}")
+        else:
+            copy_ds = set(args.copy_from_datasets)
+            all_responses = load_jsonl(resp_path)
+            relevant = [r for r in all_responses if r.get("dataset") in copy_ds]
+            write_jsonl(output_dir / "responses.jsonl", relevant)
+            print(f"Copied {len(relevant)} response records to {output_dir / 'responses.jsonl'} (for --resume)")
 
     sampling_config = {
-        "datasets": args.datasets,
+        "datasets_sampled": args.datasets,
+        "datasets_copied": args.copy_from_datasets,
+        "copy_from_file": str(args.copy_from_file) if args.copy_from_file else None,
         "profile": args.profile,
         "sample_plan": sample_plan,
         "seed": args.seed,
         "output_dir": str(output_dir),
-        "num_items": len(sampled_items),
+        "num_items": len(all_items),
+        "num_copied": len(copied_items),
+        "num_fresh": len(fresh_items),
     }
     (output_dir / "sampling_config.json").write_text(
         json.dumps(sampling_config, indent=2),
         encoding="utf-8",
     )
 
-    print(f"Saved {len(sampled_items)} sampled items to {output_dir / 'sampled_items.jsonl'}")
+    print(
+        f"Saved {len(all_items)} items to {output_dir / 'sampled_items.jsonl'} "
+        f"({len(copied_items)} copied, {len(fresh_items)} freshly sampled)"
+    )
 
 
 if __name__ == "__main__":
