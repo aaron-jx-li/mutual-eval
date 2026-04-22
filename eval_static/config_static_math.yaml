@@ -1,36 +1,45 @@
 # Static math evaluation config
 #
 # Workflow:
-# 1. Sample a fixed item set:
-#    python eval_static/sample_static_math.py --config eval_static/config.yaml
+# 1. Sample a fixed item set (copies aime/olympiad from v0, samples hle-math fresh):
+#    python eval_static/sample_static_math.py --config eval_static/config_static_math.yaml
 #
-# 2. Evaluate on that saved sample:
-#    python eval_static/eval_static_math.py --config eval_static/config.yaml
+# 2. Evaluate on that saved sample (--resume skips already-done aime/olympiad records):
+#    python eval_static/eval_static_math.py --config eval_static/config_static_math.yaml
 
 sampling:
   profile: paper
   seed: 0
-  output_dir: results/static_eval/math_v0
+  output_dir: results/static_eval/math_v1
+  # Datasets to sample fresh (legacy sets are not re-sampled)
   datasets:
-    - gsm8k
-    - mmlu-abstract
-    - mmlu-college
-    - math-algebra
-    - math-counting
-    - math-geometry
-    - math-number
-    - math-intermediate
-    - math-prealgebra
-    - math-precalculus
-    - aime-2025
-    - aime-2026
-    - olympiad-math
+    - hle-math
+  # Copy these datasets verbatim from v0 instead of re-sampling.
+  # responses_file is also copied so --resume skips already-evaluated items.
+  copy_from:
+    file: results/static_eval/math_v0/sampled_items.jsonl
+    responses_file: results/static_eval/math_v0/responses.jsonl
+    datasets:
+      - aime-2025
+      - aime-2026
+      - olympiad-math
 
 evaluation:
-  sample_file: results/static_eval/math_v0/sampled_items.jsonl
+  sample_file: results/static_eval/math_v1/sampled_items.jsonl
   judge_model: gpt-4.1-mini
-  use_litellm: true
-  output_dir: results/static_eval/math_v0
+  use_litellm: false
+  litellm_models:
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+  output_dir: results/static_eval/math_v1
   save_every: 50
   resume: true
   models:
@@ -49,3 +58,14 @@ evaluation:
     - mistral-large-3
     - qwen3-max-thinking
     - llama-4-maverick-instruct
+  generation_timeout: 300
+  # Match Gemini 2.5/3.1 cap in eval_static_math.py (65536); revert to 32768 if you want the old default.
+  generation_max_tokens: 65536
+  generation_retries: 2
+  model_max_tokens:
+    claude-haiku-4-5: 56000  # haiku-4-5-20251001 API cap is 64000, below the global 65536
+    gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
+    gpt-5.4: ~       # thinking model: exhausts 16384 on hard problems
+    gpt-4.1: 32768
+    gpt-4.1-mini: 32768
+  max_workers: 4

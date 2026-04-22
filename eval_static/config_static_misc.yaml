@@ -1,0 +1,78 @@
+# Misc v1 static evaluation (300 items total)
+#
+# Selection:
+#   HLE — Humanities/Social Science: 90  (text-only, exactMatch, non-numeric gold)
+#   HLE — Other: 83                     (text-only)
+#   HLE — Biology/Medicine: 52          (text-only)
+#   HLE — Engineering: 25               (text-only; 27 trimmed to 25 for round total)
+#   HLE subtotal: 250
+#   SimpleQA: 50 stratified by topic (below)
+#
+# Workflow (run from the mutual-eval repo root so output_dir resolves correctly):
+#   python eval_static/sample_static_misc.py --config eval_static/config_static_misc.yaml
+#   python eval_static/eval_static_misc.py --config eval_static/config_static_misc.yaml
+
+sampling:
+  seed: 0
+  output_dir: results/static_eval/misc_v1
+  hle:
+    humanities_social_science: 90
+    other: 83
+    biology_medicine: 52
+    engineering: 25
+  simpleqa:
+    hf_path: basicv8vc/SimpleQA
+    split: test
+    topics:
+      Science and technology: 12
+      Politics: 10
+      Art: 8
+      Geography: 7
+      History: 6
+      Sports: 4
+      Music: 3
+
+evaluation:
+  sample_file: results/static_eval/misc_v1/sampled_items.jsonl
+  judge_model: gpt-4.1-mini
+  use_litellm: false
+  litellm_models: []
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
+  output_dir: results/static_eval/misc_v1
+  save_every: 50
+  resume: true
+  models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct
+  generation_timeout: 120
+  generation_max_tokens: 65536
+  generation_retries: 2
+  model_max_tokens:
+    claude-haiku-4-5: 56000
+    gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
+    gpt-5.4: ~       # thinking model: exhausts 16384 on hard problems
+    gpt-4.1: 32768
+    gpt-4.1-mini: 32768
+  max_workers: 4

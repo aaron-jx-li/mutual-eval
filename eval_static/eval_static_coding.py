@@ -171,6 +171,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional limit on the number of sampled items to evaluate, useful for smoke tests.",
     )
     parser.add_argument(
+        "--generation-timeout",
+        type=int,
+        default=None,
+        help="Provider API timeout seconds for generation requests.",
+    )
+    parser.add_argument(
         "--use-litellm",
         action="store_true",
         help="Route model calls through a single OpenAI-compatible LiteLLM endpoint.",
@@ -232,6 +238,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.max_workers = int(section.get("max_workers", 4))
     if args.max_items is None and section.get("max_items") is not None:
         args.max_items = int(section.get("max_items"))
+    if args.generation_timeout is None:
+        args.generation_timeout = int(section.get("generation_timeout", 120))
     if not args.use_litellm:
         args.use_litellm = bool(section.get("use_litellm", False))
 
@@ -302,7 +310,7 @@ def call_openai_compatible(
     return extract_chat_content(resp.choices[0].message.content)
 
 
-def build_clients(selected_models: list[str]) -> dict[str, Any]:
+def build_clients(selected_models: list[str], generation_timeout: int) -> dict[str, Any]:
     clients: dict[str, Any] = {}
     providers = {MODEL_LOOKUP[name].provider for name in selected_models}
 
@@ -310,20 +318,24 @@ def build_clients(selected_models: list[str]) -> dict[str, Any]:
         key = get_env_value("OPENAI_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("OPENAI_BASE_URL"), "openai")
-            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
 
     if "anthropic" in providers:
         key = get_env_value("ANTHROPIC_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("ANTHROPIC_BASE_URL"), "anthropic")
-            clients["anthropic"] = anthropic.Anthropic(api_key=key, base_url=base_url, timeout=120)
+            clients["anthropic"] = anthropic.Anthropic(
+                api_key=key,
+                base_url=base_url,
+                timeout=generation_timeout,
+            )
 
     if "google" in providers:
         key = get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("GEMINI_BASE_URL"), "google")
             if base_url:
-                clients["google"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+                clients["google"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
 
     if "openrouter" in providers:
         key = get_env_value("OPENROUTER_API_KEY")
@@ -331,14 +343,19 @@ def build_clients(selected_models: list[str]) -> dict[str, Any]:
             clients["openrouter"] = OpenAI(
                 api_key=key,
                 base_url="https://openrouter.ai/api/v1",
-                timeout=120,
+                timeout=generation_timeout,
             )
 
     return clients
 
 
-def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) -> dict[str, Any]:
-    clients = build_clients(selected_models)
+def build_clients_with_mode(
+    selected_models: list[str],
+    generation_timeout: int,
+    *,
+    use_litellm: bool,
+) -> dict[str, Any]:
+    clients = build_clients(selected_models, generation_timeout)
     routed_models = [
         label
         for label in selected_models
@@ -355,7 +372,7 @@ def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) ->
                 "When --use-litellm is enabled, set LITELLM_API_KEY (or OPENAI_API_KEY) "
                 "and LITELLM_BASE_URL (or OPENAI_BASE_URL)."
             )
-        clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+        clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
     return clients
 
 
@@ -969,18 +986,18 @@ def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     summary_rows: list[dict[str, Any]] = []
     for (model_label, dataset_name), group in sorted(grouped.items()):
-        scored = [row for row in group if row["correct"] is not None]
-        all_binary = [int(bool(row["correct"])) for row in scored]
+        num_items = len(group)
+        num_correct = sum(1 for row in group if row["correct"] is True)
         exec_count = sum(1 for row in group if row["grading_method"] == "exec_tests")
         error_count = sum(1 for row in group if row["status"] != "ok")
         summary_rows.append(
             {
                 "model_label": model_label,
                 "dataset": dataset_name,
-                "num_items": len(group),
-                "num_scored": len(scored),
-                "num_correct": sum(all_binary),
-                "accuracy": mean(all_binary) if all_binary else None,
+                "num_items": num_items,
+                "num_scored": num_items,
+                "num_correct": num_correct,
+                "accuracy": (num_correct / num_items) if num_items else None,
                 "exec_graded": exec_count,
                 "generation_errors": error_count,
             }
@@ -1050,6 +1067,8 @@ def evaluate_item(
             record["latency_s"] = round(time.time() - started, 2)
         except Exception as exc:
             record["status"] = "generation_error"
+            record["correct"] = False
+            record["grading_method"] = "generation_error"
             record["latency_s"] = round(time.time() - started, 2)
             item_results.append((eval_key, record))
             continue
@@ -1085,7 +1104,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_model_specs = [MODEL_LOOKUP[label] for label in args.models]
-    clients = build_clients_with_mode(args.models, use_litellm=args.use_litellm)
+    clients = build_clients_with_mode(
+        args.models,
+        args.generation_timeout,
+        use_litellm=args.use_litellm,
+    )
     validate_clients_for_models(args.models, clients, use_litellm=args.use_litellm)
     sample_file = Path(args.sample_file)
     sampled_items = load_jsonl(sample_file)
@@ -1102,6 +1125,7 @@ def main() -> None:
         "sample_file": str(sample_file),
         "datasets": sorted(dataset_counts.keys()),
         "sample_plan": dict(dataset_counts),
+        "generation_timeout": args.generation_timeout,
         "use_litellm": args.use_litellm,
         "max_workers": args.max_workers,
         "max_items": args.max_items,

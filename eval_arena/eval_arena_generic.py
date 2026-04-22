@@ -173,6 +173,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        default=False,
+        help="When resuming, treat all errored rows as completed and skip them.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from an existing responses.jsonl in the output directory.",
@@ -209,13 +215,13 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     section = config.get("evaluation", {})
 
     if args.input_file is None:
-        args.input_file = section.get("input_file", "data/arena_140k_generic.jsonl")
+        args.input_file = section.get("input_file", "data/v1_generic_1000.jsonl")
     if args.first_k is None:
         args.first_k = int(section.get("first_k", 500))
     if args.models is None:
         args.models = section.get("models", list(DEFAULT_MODELS))
     if args.output_dir is None:
-        args.output_dir = section.get("output_dir", "results/arena_eval/generic_v0")
+        args.output_dir = section.get("output_dir", "results/arena_eval/generic_v1")
     if args.rm_base_url is None:
         args.rm_base_url = section.get("rm_base_url")
     if args.rm_token is None:
@@ -240,8 +246,11 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.litellm_models = list(section.get("litellm_models", []))
     if args.retry_statuses is None:
         args.retry_statuses = list(section.get("retry_statuses", ["generation_error"]))
+    if args.no_retry:
+        args.retry_statuses = []
     if not args.resume:
         args.resume = bool(section.get("resume", False))
+    args.model_max_tokens = {k: (int(v) if v is not None else None) for k, v in section.get("model_max_tokens", {}).items()}
     return args
 
 
@@ -478,6 +487,7 @@ def build_clients(
         missing.append("openrouter")
     if missing:
         raise SystemExit(f"Missing API credentials/config for providers: {', '.join(sorted(set(missing)))}")
+    clients["_generation_timeout"] = generation_timeout
     return clients
 
 
@@ -542,13 +552,20 @@ def call_model(
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
-        return call_openai_compatible(
-            clients["google"],
-            spec.model_id,
-            user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=generation_max_tokens,
-        )
+        _timeout = clients.get("_generation_timeout")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(
+                call_openai_compatible,
+                clients["google"],
+                spec.model_id,
+                user_prompt=prompt,
+                temperature=0.0,
+                max_tokens=generation_max_tokens,
+            )
+            try:
+                return _fut.result(timeout=_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Request timed out after {_timeout}s.")
     if spec.provider == "openrouter":
         return call_openai_compatible(
             clients["openrouter"],
@@ -734,6 +751,7 @@ def evaluate_item(
     reward_semaphore: threading.Semaphore,
     completed_keys: set[str],
     generation_max_tokens: int,
+    model_max_tokens: dict[str, int | None] | None,
     use_litellm: bool,
     litellm_models: set[str] | None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -764,12 +782,13 @@ def evaluate_item(
 
         started = time.time()
         generation_started = time.time()
+        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
         try:
             response_text = call_model(
                 model_spec,
                 clients,
                 item["prompt"],
-                generation_max_tokens=generation_max_tokens,
+                generation_max_tokens=effective_max_tokens,
                 use_litellm=use_litellm,
                 litellm_models=litellm_models,
             )
@@ -904,6 +923,7 @@ def main() -> None:
         "max_workers": args.max_workers,
         "generation_timeout": args.generation_timeout,
         "generation_max_tokens": args.generation_max_tokens,
+        "model_max_tokens": args.model_max_tokens,
         "reward_timeout": args.reward_timeout,
         "reward_max_concurrency": min(args.reward_max_concurrency, 8),
         "use_litellm": args.use_litellm,
@@ -967,6 +987,7 @@ def main() -> None:
                 reward_semaphore=reward_semaphore,
                 completed_keys=completed_keys_snapshot,
                 generation_max_tokens=args.generation_max_tokens,
+                model_max_tokens=args.model_max_tokens,
                 use_litellm=args.use_litellm,
                 litellm_models=litellm_models,
             )
@@ -985,6 +1006,7 @@ def main() -> None:
                     reward_semaphore=reward_semaphore,
                     completed_keys=completed_keys_snapshot,
                     generation_max_tokens=args.generation_max_tokens,
+                    model_max_tokens=args.model_max_tokens,
                     use_litellm=args.use_litellm,
                     litellm_models=litellm_models,
                 )

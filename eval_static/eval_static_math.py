@@ -164,6 +164,8 @@ DATASET_SPECS: list[DatasetSpec] = [
     DatasetSpec("aime-2025", "test-time-compute/aime_2025", None, "test", "aime", 5, 30),
     DatasetSpec("aime-2026", "MathArena/aime_2026", None, "train", "aime", 5, 30),
     DatasetSpec("olympiad-math", "math-ai/olympiadbench", None, "test", "olympiad", 10, 80),
+    # HLE (Humanity's Last Exam) — text-only math subset
+    DatasetSpec("hle-math", "cais/hle", None, "test", "hle", 10, 60),
 ]
 
 DATASET_LOOKUP = {spec.name: spec for spec in DATASET_SPECS}
@@ -258,6 +260,25 @@ def parse_args() -> argparse.Namespace:
         help="OpenAI judge model used for correctness grading.",
     )
     parser.add_argument(
+        "--generation-timeout",
+        type=int,
+        default=None,
+        help="Provider API timeout seconds for generation requests.",
+    )
+    parser.add_argument(
+        "--generation-max-tokens",
+        type=int,
+        default=None,
+        dest="generation_max_tokens",
+        help="Maximum tokens for generation (default from config: 32768).",
+    )
+    parser.add_argument(
+        "--generation-retries",
+        type=int,
+        default=None,
+        help="Number of retries for empty or failed generation attempts (default: 2).",
+    )
+    parser.add_argument(
         "--output-dir",
         default=None,
         help="Directory for results. Defaults to results/static_eval/<timestamp>.",
@@ -283,6 +304,16 @@ def parse_args() -> argparse.Namespace:
         "--use-litellm",
         action="store_true",
         help="Route all model and judge calls through a single OpenAI-compatible LiteLLM endpoint.",
+    )
+    parser.add_argument(
+        "--litellm-models",
+        nargs="+",
+        default=None,
+        choices=[spec.label for spec in MODEL_SPECS],
+        help=(
+            "Explicit subset of model labels to route through LiteLLM. "
+            "When set, this overrides the default all-model behavior."
+        ),
     )
     return parser.parse_args()
 
@@ -333,6 +364,16 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
                 args.sample_file = str(Path(sampling_output_dir) / "sampled_items.jsonl")
     if args.judge_model is None:
         args.judge_model = section.get("judge_model", "gpt-4.1-mini")
+    if args.generation_timeout is None:
+        args.generation_timeout = int(section.get("generation_timeout", 120))
+    if args.generation_max_tokens is None:
+        args.generation_max_tokens = int(section.get("generation_max_tokens", 32768))
+    if args.generation_retries is None:
+        args.generation_retries = int(section.get("generation_retries", 2))
+    args.model_max_tokens = {
+        key: (int(value) if value is not None else None)
+        for key, value in section.get("model_max_tokens", {}).items()
+    }
     if args.output_dir is None:
         args.output_dir = section.get("output_dir")
     if args.save_every == 50:
@@ -343,6 +384,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.max_workers = int(section.get("max_workers", 4))
     if not args.use_litellm:
         args.use_litellm = bool(section.get("use_litellm", False))
+    if args.litellm_models is None and section.get("litellm_models") is not None:
+        args.litellm_models = list(section.get("litellm_models", []))
 
     if not args.sample_file:
         raise SystemExit("Error: --sample-file is required, either via CLI or config file.")
@@ -362,7 +405,7 @@ def build_sample_plan(selected_datasets: list[str], profile: str, uniform_n: int
     return plan
 
 
-def build_clients(selected_models: list[str]) -> dict[str, Any]:
+def build_clients(selected_models: list[str], generation_timeout: int) -> dict[str, Any]:
     clients: dict[str, Any] = {}
     providers = {MODEL_LOOKUP[name].provider for name in selected_models}
 
@@ -370,20 +413,24 @@ def build_clients(selected_models: list[str]) -> dict[str, Any]:
         key = get_env_value("OPENAI_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("OPENAI_BASE_URL"), "openai")
-            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+            clients["openai"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
 
     if "anthropic" in providers:
         key = get_env_value("ANTHROPIC_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("ANTHROPIC_BASE_URL"), "anthropic")
-            clients["anthropic"] = anthropic.Anthropic(api_key=key, base_url=base_url, timeout=120)
+            clients["anthropic"] = anthropic.Anthropic(
+                api_key=key,
+                base_url=base_url,
+                timeout=generation_timeout,
+            )
 
     if "google" in providers:
         key = get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY")
         if key:
             base_url = normalize_base_url(get_env_value("GEMINI_BASE_URL"), "google")
             if base_url:
-                clients["google"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+                clients["google"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
 
     if "openrouter" in providers:
         key = get_env_value("OPENROUTER_API_KEY")
@@ -391,17 +438,24 @@ def build_clients(selected_models: list[str]) -> dict[str, Any]:
             clients["openrouter"] = OpenAI(
                 api_key=key,
                 base_url="https://openrouter.ai/api/v1",
-                timeout=120,
+                timeout=generation_timeout,
             )
 
     if "openai" not in clients:
         sys.exit("OPENAI_API_KEY is required for the judge model.")
+    clients["_generation_timeout"] = generation_timeout
     return clients
 
 
-def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) -> dict[str, Any]:
-    clients = build_clients(selected_models)
-    if use_litellm:
+def build_clients_with_mode(
+    selected_models: list[str],
+    generation_timeout: int,
+    *,
+    use_litellm: bool,
+    litellm_models: set[str] | None = None,
+) -> dict[str, Any]:
+    clients = build_clients(selected_models, generation_timeout)
+    if use_litellm or litellm_models:
         key = get_env_value("LITELLM_API_KEY", "OPENAI_API_KEY")
         base_url = normalize_base_url(
             get_env_value("LITELLM_BASE_URL", "OPENAI_BASE_URL"),
@@ -412,8 +466,14 @@ def build_clients_with_mode(selected_models: list[str], *, use_litellm: bool) ->
                 "When --use-litellm is enabled, set LITELLM_API_KEY (or OPENAI_API_KEY) "
                 "and LITELLM_BASE_URL (or OPENAI_BASE_URL)."
             )
-        clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=120)
+        clients["litellm"] = OpenAI(api_key=key, base_url=base_url, timeout=generation_timeout)
     return clients
+
+
+def _should_use_litellm(spec, *, use_litellm: bool, litellm_models: set[str] | None) -> bool:
+    if litellm_models is not None:
+        return spec.label in litellm_models and spec.litellm_model_id is not None
+    return should_use_litellm_for_model(spec, use_litellm=use_litellm)
 
 
 def load_raw_rows(spec: DatasetSpec) -> list[dict]:
@@ -431,6 +491,16 @@ def load_raw_rows(spec: DatasetSpec) -> list[dict]:
             and row.get("language") == "English"
             and row.get("modality") == "Text-only"
             and not row.get("is_multiple_answer", False)
+        ]
+    if spec.kind == "hle":
+        # Filter to math questions and sanitize each row.
+        # HF materialises all Image features as PngImageFile objects (including
+        # fields we don't know about), so we recursively strip any value that
+        # isn't a JSON primitive rather than trying to name specific keys.
+        rows = [
+            _sanitize_for_json(row)
+            for row in rows
+            if "math" in str(row.get("category", "")).lower()
         ]
     return rows
 
@@ -489,6 +559,8 @@ def build_raw_question(dataset_spec: DatasetSpec, item: dict) -> str:
         return item.get("question") or item.get("problem")
     if dataset_spec.kind == "olympiad":
         return item["question"]
+    if dataset_spec.kind == "hle":
+        return item["question"]
     return item["problem"]
 
 
@@ -506,6 +578,8 @@ def build_gold_answer(dataset_spec: DatasetSpec, item: dict) -> str:
         if isinstance(final_answer, list):
             return " ; ".join(str(part) for part in final_answer)
         return str(final_answer)
+    if dataset_spec.kind == "hle":
+        return str(item["answer"])
     return item["solution"]
 
 
@@ -527,6 +601,8 @@ def get_item_metadata(dataset_spec: DatasetSpec, item: dict) -> dict[str, Any]:
             "level": item.get("difficulty", "Competition"),
             "subject": item.get("subfield") or item.get("subject") or "Olympiad",
         }
+    if dataset_spec.kind == "hle":
+        return {"level": "Expert", "subject": item.get("category", "Mathematics")}
     return {"level": item.get("level"), "subject": item.get("type")}
 
 
@@ -593,14 +669,27 @@ def judge_correctness(
     }
 
 
-def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False) -> str:
-    if should_use_litellm_for_model(spec, use_litellm=use_litellm):
+def call_model(
+    spec,
+    clients: dict[str, Any],
+    prompt: str,
+    *,
+    generation_max_tokens: int | None,
+    use_litellm: bool = False,
+    litellm_models: set[str] | None = None,
+) -> str:
+    # Gemini 2.5/3.1 are thinking models that can consume a large output budget
+    # before they emit the final answer, so match the arena eval headroom here.
+    google_max_tokens = generation_max_tokens
+    if spec.provider == "google" and any(prefix in spec.model_id for prefix in ("2.5", "3.1")):
+        google_max_tokens = 65536
+    if _should_use_litellm(spec, use_litellm=use_litellm, litellm_models=litellm_models):
         return call_openai_compatible(
             clients["litellm"],
             get_routed_model_id(spec, use_litellm=True),
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "openai":
         return call_openai_compatible(
@@ -608,34 +697,54 @@ def call_model(spec, clients: dict[str, Any], prompt: str, *, use_litellm: bool 
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
-        return call_openai_compatible(
-            clients["google"],
-            spec.model_id,
-            user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=2048,
-        )
+        # Google's API sends HTTP keepalives while thinking, which resets the
+        # httpx read timeout. Enforce a hard wall-clock timeout via a thread.
+        _generation_timeout = clients.get("_generation_timeout")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(
+                call_openai_compatible,
+                clients["google"],
+                spec.model_id,
+                user_prompt=prompt,
+                temperature=0.0,
+                max_tokens=google_max_tokens,
+            )
+            try:
+                return _fut.result(timeout=_generation_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Request timed out after {_generation_timeout}s.")
     if spec.provider == "openrouter":
         return call_openai_compatible(
             clients["openrouter"],
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens,
         )
     if spec.provider == "anthropic":
         resp = clients["anthropic"].messages.create(
             model=spec.model_id,
-            max_tokens=2048,
+            max_tokens=generation_max_tokens or 8192,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
     raise ValueError(f"Unsupported provider: {spec.provider}")
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively replace any non-JSON-serializable value (e.g. PIL Images) with None."""
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return None
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -736,8 +845,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     summary_rows: list[dict[str, Any]] = []
     for (model_label, dataset_name), group in sorted(grouped.items()):
-        scored = [row for row in group if row["correct"] is not None]
-        all_binary = [int(bool(row["correct"])) for row in scored]
+        all_binary = [1 if row.get("correct") is True else 0 for row in group]
         judge_count = sum(1 for row in group if row["grading_method"] == "llm_judge")
         error_count = sum(1 for row in group if row["status"] != "ok")
         summary_rows.append(
@@ -745,7 +853,7 @@ def summarize_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "model_label": model_label,
                 "dataset": dataset_name,
                 "num_items": len(group),
-                "num_scored": len(scored),
+                "num_scored": len(group),
                 "num_correct": sum(all_binary),
                 "accuracy": mean(all_binary) if all_binary else None,
                 "judge_graded": judge_count,
@@ -762,7 +870,11 @@ def evaluate_item(
     clients: dict[str, Any],
     judge_model: str,
     completed_keys: set[str],
+    generation_max_tokens: int | None,
+    generation_retries: int,
+    model_max_tokens: dict[str, int | None] | None,
     use_litellm: bool,
+    litellm_models: set[str] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     item_results: list[tuple[str, dict[str, Any]]] = []
 
@@ -790,25 +902,51 @@ def evaluate_item(
             "judge_reason": None,
             "judge_raw": None,
             "latency_s": None,
+            "generation_attempts": 0,
         }
 
         started = time.time()
-        try:
-            response_text = call_model(model_spec, clients, item["prompt"], use_litellm=use_litellm)
-            record["response_text"] = response_text
-            record["latency_s"] = round(time.time() - started, 2)
-        except Exception as exc:
+        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
+        response_text: str | None = None
+        last_generation_error: str | None = None
+        for attempt in range(generation_retries + 1):
+            record["generation_attempts"] = attempt + 1
+            try:
+                candidate = call_model(
+                    model_spec,
+                    clients,
+                    item["prompt"],
+                    generation_max_tokens=effective_max_tokens,
+                    use_litellm=use_litellm,
+                    litellm_models=litellm_models,
+                )
+                if candidate.strip():
+                    response_text = candidate
+                    break
+                last_generation_error = "Model returned an empty response after extraction."
+            except Exception as exc:
+                last_generation_error = str(exc)
+            if attempt < generation_retries:
+                time.sleep(min(2 ** attempt, 4))
+
+        record["latency_s"] = round(time.time() - started, 2)
+        if response_text is None:
             record["status"] = "generation_error"
-            record["latency_s"] = round(time.time() - started, 2)
-            record["judge_reason"] = str(exc)
+            record["correct"] = False
+            record["grading_method"] = "generation_error"
+            record["judge_reason"] = last_generation_error or "Unknown generation failure."
             item_results.append((eval_key, record))
             continue
+        record["response_text"] = response_text
 
         judge_spec = MODEL_LOOKUP.get(judge_model)
         judge_uses_litellm = (
-            use_litellm
-            and judge_spec is not None
-            and should_use_litellm_for_model(judge_spec, use_litellm=True)
+            judge_spec is not None
+            and _should_use_litellm(
+                judge_spec,
+                use_litellm=use_litellm,
+                litellm_models=litellm_models,
+            )
         )
         effective_judge_model = (
             get_routed_model_id(judge_spec, use_litellm=True)
@@ -856,7 +994,24 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_model_specs = [MODEL_LOOKUP[label] for label in args.models]
-    if args.use_litellm:
+    litellm_models = set(args.litellm_models) if args.litellm_models else None
+    selected_labels = {spec.label for spec in selected_model_specs}
+    if litellm_models is not None:
+        unselected = sorted(litellm_models - selected_labels)
+        if unselected:
+            sys.exit(
+                "LiteLLM subset includes models not in --models/config: "
+                + ", ".join(unselected)
+            )
+        unsupported_subset = sorted(
+            label for label in litellm_models if MODEL_LOOKUP[label].litellm_model_id is None
+        )
+        if unsupported_subset:
+            sys.exit(
+                "LiteLLM is not configured for these requested subset models: "
+                + ", ".join(unsupported_subset)
+            )
+    elif args.use_litellm:
         unsupported = [spec.label for spec in selected_model_specs if spec.litellm_model_id is None]
         if unsupported:
             sys.exit(
@@ -864,7 +1019,12 @@ def main() -> None:
                 + ", ".join(unsupported)
                 + ". Remove them from the config/models list or add mappings in MODEL_SPECS."
             )
-    clients = build_clients_with_mode(args.models, use_litellm=args.use_litellm)
+    clients = build_clients_with_mode(
+        args.models,
+        args.generation_timeout,
+        use_litellm=args.use_litellm,
+        litellm_models=litellm_models,
+    )
     sample_file = Path(args.sample_file)
     sampled_items = load_jsonl(sample_file)
     dataset_counts: dict[str, int] = defaultdict(int)
@@ -877,7 +1037,12 @@ def main() -> None:
         "datasets": sorted(dataset_counts.keys()),
         "sample_plan": dict(dataset_counts),
         "judge_model": args.judge_model,
+        "generation_timeout": args.generation_timeout,
+        "generation_max_tokens": args.generation_max_tokens,
+        "generation_retries": args.generation_retries,
+        "model_max_tokens": args.model_max_tokens,
         "use_litellm": args.use_litellm,
+        "litellm_models": sorted(litellm_models) if litellm_models is not None else None,
         "max_workers": args.max_workers,
         "output_dir": str(output_dir),
         "resume": args.resume,
@@ -931,7 +1096,11 @@ def main() -> None:
                 clients=clients,
                 judge_model=args.judge_model,
                 completed_keys=completed_keys_snapshot,
+                generation_max_tokens=args.generation_max_tokens,
+                generation_retries=args.generation_retries,
+                model_max_tokens=args.model_max_tokens,
                 use_litellm=args.use_litellm,
+                litellm_models=litellm_models,
             )
             for eval_key, record in item_results:
                 record_result(eval_key, record)
@@ -945,7 +1114,11 @@ def main() -> None:
                     clients=clients,
                     judge_model=args.judge_model,
                     completed_keys=completed_keys_snapshot,
+                    generation_max_tokens=args.generation_max_tokens,
+                    generation_retries=args.generation_retries,
+                    model_max_tokens=args.model_max_tokens,
                     use_litellm=args.use_litellm,
+                    litellm_models=litellm_models,
                 )
                 for item in pending_items
             ]

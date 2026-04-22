@@ -1,0 +1,26 @@
+{
+  "dataset": "lmarena-ai/arena-expert-5k",
+  "split": "train",
+  "allowed_languages": [
+    "en"
+  ],
+  "judge_model": "gpt-4.1-mini",
+  "min_confidence": 0.7,
+  "max_workers": 8,
+  "coding": {
+    "output": "data/v1_coding_500.jsonl",
+    "count": 500,
+    "target": 500
+  },
+  "math": {
+    "output": "data/v1_math_200.jsonl",
+    "count": 200,
+    "target": 200,
+    "extra_tags": []
+  },
+  "generic": {
+    "output": "data/v1_misc_300.jsonl",
+    "count": 300,
+    "target": 300
+  }
+}

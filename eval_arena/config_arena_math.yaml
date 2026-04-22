@@ -4,18 +4,24 @@
 #   python eval_arena/eval_arena_math.py --config eval_arena/config_arena_math.yaml
 
 evaluation:
-  input_file: data/arena_math_900.json
+  input_file: data/v1_math_200.jsonl
   output_dir: results/arena_eval/math_v1
   use_litellm: false
   litellm_models: []
-  generation_max_tokens: 32768
+  generation_max_tokens: 65536
+  model_max_tokens:
+    claude-haiku-4-5: 56000  # haiku-4-5-20251001 API cap is 64000, below the global 65536
+    gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
+    gpt-5.4: ~       # thinking model: exhausts 16384 on hard problems
+    gpt-4.1: 32768
+    gpt-4.1-mini: 32768
   save_every: 50
   resume: true
   retry_statuses:
     - generation_error
     - reward_error
   max_workers: 8
-  generation_timeout: 120
+  generation_timeout: 480
   reward_timeout: 300
   reward_max_concurrency: 8
   rm_base_url: ${ARENA_RM_BASE_URL}

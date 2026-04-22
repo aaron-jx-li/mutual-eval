@@ -158,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        default=False,
+        help="When resuming, treat all errored rows as completed and skip them.",
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=None,
@@ -222,6 +228,8 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.resume = bool(section.get("resume", False))
     if args.retry_statuses is None:
         args.retry_statuses = list(section.get("retry_statuses", ["generation_error"]))
+    if args.no_retry:
+        args.retry_statuses = []
     if args.max_rows is None and section.get("max_rows") is not None:
         args.max_rows = int(section.get("max_rows"))
     if args.generation_max_tokens is None:
@@ -252,7 +260,7 @@ def load_input_rows(path: Path) -> list[dict[str, Any]]:
 def build_question_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
-        question = str(row.get("question") or "").strip()
+        question = str(row.get("question") or row.get("prompt") or "").strip()
         if not question:
             continue
         item_id = str(row.get("id") or f"arena_{row_index:06d}")
@@ -370,6 +378,7 @@ def build_clients(selected_models: list[str], generation_timeout: int) -> dict[s
         missing.append("openrouter")
     if missing:
         raise SystemExit(f"Missing API credentials/config for providers: {', '.join(sorted(set(missing)))}")
+    clients["_generation_timeout"] = generation_timeout
     return clients
 
 
@@ -427,13 +436,20 @@ def call_model(spec, clients: dict[str, Any], prompt: str, *, generation_max_tok
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "google":
-        return call_openai_compatible(
-            clients["google"],
-            spec.model_id,
-            user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=google_max_tokens,
-        )
+        _timeout = clients.get("_generation_timeout")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(
+                call_openai_compatible,
+                clients["google"],
+                spec.model_id,
+                user_prompt=prompt,
+                temperature=0.0,
+                max_tokens=google_max_tokens,
+            )
+            try:
+                return _fut.result(timeout=_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Request timed out after {_timeout}s.")
     if spec.provider == "openrouter":
         return call_openai_compatible(
             clients["openrouter"],
