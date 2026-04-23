@@ -1,0 +1,130 @@
+# Terminal-Bench 2.0 agentic evaluation config.
+#
+# Runner:  harbor run  (https://github.com/laude-institute/harbor)
+# Agent :  terminus-2
+# Tasks :  Terminal-Bench 2.0 (89 hand-authored tasks)
+#
+# Usage:
+#   python eval_agentic/eval_terminal_bench.py --config eval_agentic/config_terminal_bench.yaml
+#
+# Smoke test (one model, three tasks, one attempt each):
+#   python eval_agentic/eval_terminal_bench.py \
+#     --config eval_agentic/config_terminal_bench.yaml \
+#     --models gpt-4.1-mini --max-tasks 3 --eval-runs 1
+
+evaluation:
+  output_dir: results/agentic_eval/terminal_bench_2
+
+  # Terminal-Bench 2.0 task set. Harbor's --dataset arg understands
+  # name@version and auto-downloads into its local cache.
+  # Leave dataset_path empty to use the dataset spec; set it to a local
+  # clone if you want Harbor to read tasks off disk (requires Harbor
+  # 2.0+ which supports a path form -- check with `harbor run --help`).
+  dataset: "terminal-bench@2.0"
+  dataset_path: /home/aaronjli/terminal-bench-2
+
+  # Empty task_ids = all 89 Terminal-Bench 2.0 tasks (or whatever the
+  # dataset_path contains). Otherwise a whitelist.
+  task_ids_file: results/agentic_eval/tb2/task_ids.txt
+  task_ids: []
+  exclude_task_ids: []
+  max_tasks: null          # e.g. 10 for a smoke test
+
+  eval_runs: 1            # attempts per (model, task) for pass@k stats
+  n_concurrent: 4          # docker-level concurrency inside one harbor run
+  global_timeout_multiplier: 1.0
+
+  resume: true
+
+  # Checkpoint shared responses.jsonl + summary.csv: every N new rows (1 = after
+  # each Harbor batch; 0 = only at process exit). Same counter across models.
+  save_every: 1
+
+  agent:
+    name: terminus-2
+    # Forwarded via `--ak key=value` to Harbor. Merged with per-model
+    # routing entries below.
+    kwargs:
+      temperature: 0.2
+    # Forwarded via `--ae NAME=VALUE` (extra env vars visible to the agent).
+    env: {}
+
+  # Optional per-model agent kwargs overrides merged on top of agent.kwargs.
+  # Useful for model-specific knobs like reasoning effort.
+  model_agent_kwargs_overrides:
+    gpt-5.4:
+      reasoning_effort: medium
+
+  # Model routing. Harbor/terminus-2 invoke LiteLLM under the hood, so
+  # provider-prefixed ids (openai/gpt-5.4, anthropic/claude-opus-4-6, ...)
+  # are expected on both routes.
+  #
+  # Two routes are supported per model:
+  #   - "litellm": call through the LiteLLM gateway (LITELLM_API_KEY /
+  #                LITELLM_BASE_URL, or OPENAI_* as fallback).
+  #   - "native":  call the provider API directly (ANTHROPIC_API_KEY,
+  #                GEMINI_API_KEY, OPENROUTER_API_KEY, ...). The
+  #                provider-prefixed id tells LiteLLM which creds to use.
+  #
+  # Static-style primary flag:
+  use_litellm: false
+  #
+  # Optional subset selectors (same semantics as SWE-bench config):
+  # - litellm_models only: listed models -> litellm, others -> native.
+  # - native_models only: listed models -> native, others -> litellm.
+  # - both set: explicit assignments layered on top of use_litellm/default_route.
+  litellm_models:
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
+  native_models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct
+  #
+  # Advanced/compat knobs:
+  default_route: null      # optional synonym for use_litellm (litellm|native)
+  route_overrides: {}      # highest precedence map: {"label": "litellm|native"}
+  model_overrides:
+    # Keep eval_static label names, but route Gemini 3.1 to the provider id
+    # that has previously succeeded in static eval outputs on this setup.
+    # Note: eval_terminal_bench.py replaces "gemini/" with "openai/" when
+    # GEMINI_BASE_URL is active, so LiteLLM uses the OpenAI handler against
+    # the OpenAI-compat Gemini endpoint (sending bare "gemini-3.1-pro-preview").
+    gemini-3.1-pro: "gemini/gemini-3.1-pro-preview"
+    # Avoid LiteLLM "model not mapped" warnings seen with x-ai/grok-4.20-beta.
+    grok-4: "openrouter/x-ai/grok-4"
+
+  # Same 15-model roster as eval_static/config_static_coding.yaml.
+  models:
+    # - gpt-5.4
+    # - gpt-5-mini
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct

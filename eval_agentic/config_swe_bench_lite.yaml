@@ -1,0 +1,130 @@
+# SWE-bench Lite agentic evaluation config.
+#
+# Runner:  mini-swe-agent v2  (python -m minisweagent.run.utilities.mini_extra swebench)
+# Grader:  swebench.harness.run_evaluation  (from a local SWE-bench clone)
+#
+# Usage:
+#   python eval_agentic/eval_swe_bench_lite.py --config eval_agentic/config_swe_bench_lite.yaml
+#
+# Smoke test (first 3 instances only, single model):
+#   python eval_agentic/eval_swe_bench_lite.py \
+#     --config eval_agentic/config_swe_bench_lite.yaml \
+#     --models gpt-4.1-mini --max-instances 3
+
+evaluation:
+  output_dir: results/agentic_eval/swe_bench_lite_v1
+
+  # Local clone of https://github.com/princeton-nlp/SWE-bench used by the grader.
+  swebench_path: /home/aaronjli/SWE-bench
+
+  dataset_name: princeton-nlp/SWE-bench_Lite
+  dataset_split: test
+
+  # Empty instance_ids = run the whole 300-instance Lite test split, modulo
+  # max_instances. Set to a list of instance_ids for a custom subset.
+  instance_ids_file: results/agentic_eval/swe_bench_lite/task_ids.txt
+  instance_ids: []
+  max_instances: null     # e.g. 20 for a smoke test
+  resume: true            # skip instances already graded in output_dir
+  # When true, resume also backfills missing rows from existing
+  # model_output_dir/{agent_run,reports} artifacts if available.
+  resume_recover_artifacts: true
+  # Checkpoint model responses.jsonl every N newly graded instances.
+  # 1 = every instance, 0 = only final save.
+  save_every: 1
+
+  # Per-model concurrency = mini-swe-agent workers.
+  # Grader concurrency is separate (grading.max_workers).
+  agent:
+    module: minisweagent.run.utilities.mini_extra
+    subcommand: swebench
+    workers: 4
+    # Optional extra CLI flags forwarded as "--key value".
+    extra_args:
+      # Prevent unmapped LiteLLM price metadata from crashing Grok runs.
+      cost_tracking: ignore_errors
+
+  # Optional per-model mini-swe-agent CLI arg overrides merged on top of
+  # agent.extra_args.
+  model_agent_extra_args_overrides:
+    gpt-5.4:
+      reasoning_effort: medium
+
+  grading:
+    max_workers: 4
+    timeout: 1800
+    cache_level: env         # env | instance | base | none
+    force_rebuild: false
+    clean: false
+    open_file_limit: 4096
+    namespace: null
+    instance_image_tag: latest
+    env_image_tag: latest
+
+  # Model routing. Both mini-swe-agent v2 and litellm want provider-prefixed
+  # ids (openai/gpt-5.4, anthropic/claude-opus-4-6, gemini/gemini-2.5-pro, ...).
+  #
+  # Two routes are supported per model:
+  #   - "litellm": call through the LiteLLM gateway. Reads
+  #                LITELLM_API_KEY / LITELLM_BASE_URL (falls back to
+  #                OPENAI_API_KEY / OPENAI_BASE_URL).
+  #   - "native":  call the provider API directly. Reads that provider's
+  #                native creds (ANTHROPIC_API_KEY, GEMINI_API_KEY,
+  #                OPENROUTER_API_KEY, etc.) -- LiteLLM uses the model-id
+  #                prefix to pick the right upstream.
+  #
+  # Static-style primary flag:
+  use_litellm: true
+  #
+  # Optional subset selectors (also static-style naming):
+  # - If only litellm_models is set, listed models use LiteLLM and all other
+  #   selected models default to native.
+  # - If only native_models is set, listed models use native and all others
+  #   default to LiteLLM.
+  # - If both are set, they act as explicit per-model assignments on top of
+  #   use_litellm/default_route.
+  litellm_models: []
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
+  native_models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct
+  #
+  # Advanced/compat knobs:
+  default_route: null       # optional synonym for use_litellm (litellm|native)
+  route_overrides: {}       # highest precedence map: {"label": "litellm|native"}
+  model_overrides:
+    # Keep eval_static label names, but route Gemini 3.1 to the provider id
+    # that has previously succeeded in static eval outputs on this setup.
+    gemini-3.1-pro: "gemini/gemini-3.1-pro-preview"
+    # Avoid LiteLLM "model not mapped" issues seen with x-ai/grok-4.20-beta.
+    grok-4: "openrouter/x-ai/grok-4"
+
+  # The 15-model roster shared with eval_static/config_static_coding.yaml.
+  models:
+    - gpt-5.4
+    - gpt-5-mini
+    - gpt-4.1
+    - gpt-4.1-mini
+    - claude-opus-4-6
+    - claude-sonnet-4-6
+    - claude-haiku-4-5
+    - gemini-3.1-pro
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - grok-4
+    - deepseek-v3.2
+    - mistral-large-3
+    - qwen3-max-thinking
+    - llama-4-maverick-instruct

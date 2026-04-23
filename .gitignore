@@ -16,3 +16,4 @@ data/arena_140k.json
 data/arena_140k_math.json
 rm_test.py
 reward_client.py
+logs/*
