@@ -1,0 +1,9 @@
+# Python deps for the agentic evaluation scripts in this directory.
+# Runtime tools (Docker, harbor, mini-swe-agent, SWE-bench) are installed
+# separately -- see README.md.
+
+pyyaml>=6.0
+tqdm>=4.66
+datasets>=2.18
+openai>=1.40
+anthropic>=0.40
