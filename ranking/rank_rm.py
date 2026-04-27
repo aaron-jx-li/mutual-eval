@@ -16,8 +16,9 @@ Supported modes mirror the JSONL-based reward modes in ``ranking.py``:
        P_hat(i > j | q) = sigmoid(gamma * a_q * (pi_{i,q} - pi_{j,q}))
    - Optionally apply both-bad anchoring when both reward scores are low.
 
-3. ``reward`` / ``both-reward``: direct reward-regression IRT
-       r_{i,q} ~= a_q * (theta_i - b_q)
+3. ``z-regression`` / ``both-z-regression``: z-score reward regression IRT
+       z_{i,q} ~= a_q * (theta_i - b_q)
+   where z_{i,q} = (r_{i,q} - mu) / sigma are globally standardized reward scores.
 
 Example:
     python ranking/rank_rm.py --config ranking/config_ranking_rm.yaml
@@ -56,17 +57,17 @@ MODE_TO_ARENA_MODE = {
     "static": "soft_pairwise",
     "arena": "soft_pairwise",
     "both": "soft_pairwise",
-    "reward": "regression",
-    "both-reward": "regression",
+    "z-regression": "z-regression",
+    "both-z-regression": "z-regression",
 }
 
 
 def mode_uses_static(mode: str) -> bool:
-    return mode in {"static", "both", "both-reward"}
+    return mode in {"static", "both", "both-z-regression"}
 
 
 def mode_uses_arena(mode: str) -> bool:
-    return mode in {"arena", "both", "reward", "both-reward"}
+    return mode in {"arena", "both", "z-regression", "both-z-regression"}
 
 
 def infer_mode(
@@ -78,11 +79,11 @@ def infer_mode(
 ) -> str | None:
     if configured_mode:
         return configured_mode
-    if configured_arena_mode == "regression":
+    if configured_arena_mode == "z-regression":
         if has_static_input and has_arena_input:
-            return "both-reward"
+            return "both-z-regression"
         if has_arena_input:
-            return "reward"
+            return "z-regression"
     elif configured_arena_mode == "soft_pairwise":
         if has_static_input and has_arena_input:
             return "both"
@@ -129,8 +130,8 @@ def parse_args() -> argparse.Namespace:
             "'static': static 2PL only. "
             "'arena': reward-distilled soft-pairwise arena only. "
             "'both': joint static + reward-distilled arena. "
-            "'reward': direct reward-regression IRT only. "
-            "'both-reward': joint static + direct reward-regression IRT."
+            "'z-regression': z-score reward regression IRT only. "
+            "'both-z-regression': joint static + z-score reward regression IRT."
         ),
     )
     parser.add_argument(
@@ -180,10 +181,22 @@ def parse_args() -> argparse.Namespace:
         help="L2 regularization coefficient.",
     )
     parser.add_argument(
+        "--bb-ratio",
+        type=float,
+        default=None,
+        help="Target fraction of both-bad pairs (e.g. 0.15). Overrides --both-bad-threshold.",
+    )
+    parser.add_argument(
+        "--tie-ratio",
+        type=float,
+        default=None,
+        help="Target fraction of tie pairs (e.g. 0.15). Computed from |z_i - z_j| distribution.",
+    )
+    parser.add_argument(
         "--both-bad-threshold",
         type=float,
         default=None,
-        help="Threshold tau for identifying both-bad arena pairs.",
+        help="Fallback z-score threshold for both-bad pairs when --bb-ratio is not set.",
     )
     parser.add_argument(
         "--both-bad-use-zscore",
@@ -203,7 +216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arena-mode",
         default=None,
-        choices=["soft_pairwise", "regression"],
+        choices=["soft_pairwise", "z-regression"],
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -283,6 +296,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.lambda_bb = float(training.get("lambda_bb", 0.3))
     if args.reg_lambda is None:
         args.reg_lambda = float(training.get("reg_lambda", 1e-4))
+    if args.bb_ratio is None and training.get("bb_ratio") is not None:
+        args.bb_ratio = float(training.get("bb_ratio"))
+    if args.tie_ratio is None and training.get("tie_ratio") is not None:
+        args.tie_ratio = float(training.get("tie_ratio"))
     if args.both_bad_threshold is None:
         args.both_bad_threshold = float(training.get("both_bad_threshold", -0.5))
 
@@ -345,20 +362,23 @@ def load_static_jsonl(jsonl_paths: list[str]) -> pd.DataFrame:
                 if not line:
                     continue
                 d = json.loads(line)
-                if d.get("status") != "ok":
+                if d.get("model_label") is None:
                     continue
-                if d.get("correct") is None:
+                status = str(d.get("status", "")).strip().lower()
+                is_errored = status != "ok"
+                if not is_errored and d.get("correct") is None:
                     continue
                 dataset = str(d.get("dataset", "unknown"))
                 sample_index = d.get("sample_index")
                 raw_question_id = f"{dataset}_{sample_index}"
+                judge_result = 0 if is_errored else int(bool(d["correct"]))
                 rows.append(
                     {
                         "source": source_tag,
                         "benchmark": dataset,
                         "model_name": str(d["model_label"]),
                         "question_id": f"{source_tag}::{raw_question_id}",
-                        "judge_result": int(bool(d["correct"])),
+                        "judge_result": judge_result,
                     }
                 )
     df = pd.DataFrame(rows)
@@ -402,11 +422,55 @@ def load_arena_reward_jsonl(jsonl_paths: list[str]) -> pd.DataFrame:
     return df
 
 
+def resolve_pairwise_thresholds(
+    reward_df: pd.DataFrame,
+    *,
+    bb_ratio: float | None,
+    tie_ratio: float | None,
+    both_bad_threshold: float,
+    both_bad_use_zscore: bool,
+) -> tuple[float, float]:
+    """Compute both_bad_threshold and tie_delta from target pair ratios.
+
+    Returns (both_bad_threshold, tie_delta) where tie_delta is the |z_i - z_j|
+    cutoff below which a pair is considered a tie.  Both are derived from the
+    empirical pairwise distribution so the actual fractions match the requested
+    ratios.
+    """
+    score_col = "reward_z" if both_bad_use_zscore else "reward_raw"
+    min_scores: list[float] = []
+    abs_diffs: list[float] = []
+    for _, group in reward_df.groupby("question_id", sort=False):
+        if len(group) < 2:
+            continue
+        scores = group[score_col].to_numpy()
+        z_vals = group["reward_z"].to_numpy()
+        n = len(scores)
+        for i in range(n):
+            for j in range(i + 1, n):
+                min_scores.append(float(min(scores[i], scores[j])))
+                abs_diffs.append(float(abs(z_vals[i] - z_vals[j])))
+
+    min_arr = np.array(min_scores)
+    diff_arr = np.array(abs_diffs)
+
+    resolved_threshold = both_bad_threshold
+    if bb_ratio is not None:
+        resolved_threshold = float(np.percentile(min_arr, bb_ratio * 100))
+
+    tie_delta = 0.0
+    if tie_ratio is not None:
+        tie_delta = float(np.percentile(diff_arr, tie_ratio * 100))
+
+    return resolved_threshold, tie_delta
+
+
 def build_soft_pairwise_targets(
     reward_df: pd.DataFrame,
     *,
     both_bad_threshold: float,
     both_bad_use_zscore: bool,
+    tie_delta: float = 0.0,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     score_col = "reward_z" if both_bad_use_zscore else "reward_raw"
@@ -435,6 +499,7 @@ def build_soft_pairwise_targets(
                     "reward_z_2": z2,
                     "target_prob": soft_pref,
                     "both_bad": bool(score1 < both_bad_threshold and score2 < both_bad_threshold),
+                    "tie": bool(abs(z1 - z2) < tie_delta),
                 }
             )
     return pd.DataFrame(rows)
@@ -462,11 +527,11 @@ def fit_joint_reward_distilled_irt(
 
     arena_mode:
       'soft_pairwise' — distil rewards into soft pairwise targets (BCE loss).
-      'regression'    — regress a_q*(theta_i - b_q) directly onto raw rewards (MSE loss).
+      'z-regression'  — regress a_q*(theta_i - b_q) onto globally z-scored rewards (MSE loss).
     """
     static = static_df.copy() if static_df is not None else pd.DataFrame()
     pairwise = pairwise_df.copy() if pairwise_df is not None and arena_mode == "soft_pairwise" else pd.DataFrame()
-    reward = reward_df.copy() if reward_df is not None and arena_mode == "regression" else pd.DataFrame()
+    reward = reward_df.copy() if reward_df is not None and arena_mode == "z-regression" else pd.DataFrame()
 
     has_static = not static.empty
     has_arena = not pairwise.empty if arena_mode == "soft_pairwise" else not reward.empty
@@ -483,7 +548,7 @@ def fit_joint_reward_distilled_irt(
         if arena_mode == "soft_pairwise":
             model_series.extend([pairwise["model_1"], pairwise["model_2"]])
             question_series.append(pairwise["question_id"])
-        else:
+        elif arena_mode == "z-regression":
             model_series.append(reward["model_name"])
             question_series.append(reward["question_id"])
 
@@ -511,7 +576,7 @@ def fit_joint_reward_distilled_irt(
             pairwise["m1_idx"] = pairwise["model_1"].map(model_to_idx)
             pairwise["m2_idx"] = pairwise["model_2"].map(model_to_idx)
             pairwise["q_idx"] = pairwise["question_id"].map(q_to_idx)
-        else:
+        elif arena_mode == "z-regression":
             for _, row in reward[["question_id", "source", "benchmark"]].drop_duplicates().iterrows():
                 question_meta[str(row["question_id"])] = {
                     "source": str(row["source"]),
@@ -528,15 +593,16 @@ def fit_joint_reward_distilled_irt(
         q_s = torch.tensor(static["q_idx"].values, dtype=torch.long, device=device)
         y_s = torch.tensor(static["judge_result"].values, dtype=torch.float32, device=device)
 
-    # Soft pairwise tensors
+    # Soft pairwise tensors — tie pairs are excluded from the arena loss
     m1_t = m2_t = q_t = soft_t = None
     m1_bb = m2_bb = q_bb = None
     if has_arena and arena_mode == "soft_pairwise":
-        m1_t = torch.tensor(pairwise["m1_idx"].values, dtype=torch.long, device=device)
-        m2_t = torch.tensor(pairwise["m2_idx"].values, dtype=torch.long, device=device)
-        q_t = torch.tensor(pairwise["q_idx"].values, dtype=torch.long, device=device)
-        soft_t = torch.tensor(pairwise["target_prob"].values, dtype=torch.float32, device=device)
-        both_bad = pairwise[pairwise["both_bad"]].copy()
+        hard = pairwise[~pairwise["tie"]].copy()
+        m1_t = torch.tensor(hard["m1_idx"].values, dtype=torch.long, device=device)
+        m2_t = torch.tensor(hard["m2_idx"].values, dtype=torch.long, device=device)
+        q_t = torch.tensor(hard["q_idx"].values, dtype=torch.long, device=device)
+        soft_t = torch.tensor(hard["target_prob"].values, dtype=torch.float32, device=device)
+        both_bad = pairwise[pairwise["both_bad"] & ~pairwise["tie"]].copy()
         if not both_bad.empty:
             m1_bb = torch.tensor(both_bad["m1_idx"].values, dtype=torch.long, device=device)
             m2_bb = torch.tensor(both_bad["m2_idx"].values, dtype=torch.long, device=device)
@@ -544,10 +610,10 @@ def fit_joint_reward_distilled_irt(
 
     # Regression tensors
     m_r = q_r = r_t = None
-    if has_arena and arena_mode == "regression":
+    if has_arena and arena_mode == "z-regression":
         m_r = torch.tensor(reward["m_idx"].values, dtype=torch.long, device=device)
         q_r = torch.tensor(reward["q_idx"].values, dtype=torch.long, device=device)
-        r_t = torch.tensor(reward["reward_raw"].values, dtype=torch.float32, device=device)
+        r_t = torch.tensor(reward["reward_z"].values, dtype=torch.float32, device=device)
 
     n_models = len(all_models)
     n_questions = len(all_questions)
@@ -592,7 +658,7 @@ def fit_joint_reward_distilled_irt(
             pi_2 = torch.sigmoid(theta_2 - b_q)
             arena_logits = gamma * a_q * (pi_1 - pi_2)
             loss_arena = bce_logits(arena_logits, soft_t)
-        elif has_arena and arena_mode == "regression" and m_r is not None and len(m_r):
+        elif has_arena and arena_mode == "z-regression" and m_r is not None and len(m_r):
             theta_r = theta(m_r).squeeze(-1)
             b_r = b(q_r).squeeze(-1)
             k_r = k(q_r).squeeze(-1)
@@ -641,7 +707,7 @@ def fit_joint_reward_distilled_irt(
                 print(
                     f"  Epoch {epoch:5d} | "
                     f"static={loss_static.item():.4f}  "
-                    f"reward_mse={loss_arena.item():.4f}  "
+                    f"z_reward_mse={loss_arena.item():.4f}  "
                     f"total={total.item():.4f}"
                 )
 
@@ -727,7 +793,7 @@ def compute_metrics(
         logloss = -np.mean(target * np.log(pred_prob + eps) + (1.0 - target) * np.log(1.0 - pred_prob + eps))
         metrics["arena_soft_logloss"] = float(logloss)
         metrics["arena_both_bad_pairs"] = int(ar["both_bad"].sum())
-        tie_mask = np.isclose(target, 0.5)
+        tie_mask = ar["tie"].to_numpy(dtype=bool) if "tie" in ar.columns else np.isclose(target, 0.5)
         hard_eval_mask = (~ar["both_bad"].to_numpy(dtype=bool)) & (~tie_mask)
         metrics["arena_tie_pairs"] = int(tie_mask.sum())
         metrics["arena_hard_eval_pairs"] = int(hard_eval_mask.sum())
@@ -738,16 +804,16 @@ def compute_metrics(
         else:
             metrics["arena_hard_pair_accuracy"] = float("nan")
 
-    elif arena_mode == "regression" and reward_df is not None and not reward_df.empty:
+    elif arena_mode == "z-regression" and reward_df is not None and not reward_df.empty:
         rw = reward_df.copy()
         rw["theta"] = rw["model_name"].map(theta_map)
         rw["difficulty_b"] = rw["question_id"].map(question_map["difficulty_b"])
         rw["a_q"] = rw["question_id"].map(question_map["discrimination_exp_k"])
         rw = rw.dropna(subset=["theta", "difficulty_b", "a_q"])
         pred = rw["a_q"] * (rw["theta"] - rw["difficulty_b"])
-        residuals = pred - rw["reward_raw"]
-        metrics["arena_reward_mse"] = float((residuals ** 2).mean())
-        metrics["arena_reward_mae"] = float(residuals.abs().mean())
+        residuals = pred - rw["reward_z"]
+        metrics["arena_z_reward_mse"] = float((residuals ** 2).mean())
+        metrics["arena_z_reward_mae"] = float(residuals.abs().mean())
 
     return metrics
 
@@ -914,17 +980,30 @@ def main() -> None:
                 f"reward std={reward_df['reward_raw'].std(ddof=0):.3f}"
             )
             if args.arena_mode == "soft_pairwise":
-                pairwise_df = build_soft_pairwise_targets(
+                both_bad_threshold, tie_delta = resolve_pairwise_thresholds(
                     reward_df,
+                    bb_ratio=args.bb_ratio,
+                    tie_ratio=args.tie_ratio,
                     both_bad_threshold=args.both_bad_threshold,
                     both_bad_use_zscore=args.both_bad_use_zscore,
                 )
+                if args.bb_ratio is not None:
+                    print(f"  bb_ratio={args.bb_ratio} → both_bad_threshold={both_bad_threshold:.4f}")
+                if args.tie_ratio is not None:
+                    print(f"  tie_ratio={args.tie_ratio} → tie_delta={tie_delta:.4f}")
+                pairwise_df = build_soft_pairwise_targets(
+                    reward_df,
+                    both_bad_threshold=both_bad_threshold,
+                    both_bad_use_zscore=args.both_bad_use_zscore,
+                    tie_delta=tie_delta,
+                )
                 print(
                     f"  distilled into {len(pairwise_df)} soft pairwise rows; "
-                    f"both_bad={int(pairwise_df['both_bad'].sum()) if not pairwise_df.empty else 0}"
+                    f"both_bad={int(pairwise_df['both_bad'].sum()) if not pairwise_df.empty else 0}  "
+                    f"tie={int(pairwise_df['tie'].sum()) if not pairwise_df.empty else 0}"
                 )
             else:
-                print(f"  arena_mode=regression: using raw rewards directly")
+                print(f"  arena_mode=z-regression: using globally z-scored rewards")
     elif args.arena_reward_jsonl:
         print(f"Note: ignoring arena_reward_jsonl because mode='{args.mode}' does not use arena reward data.")
 
@@ -1000,7 +1079,7 @@ def main() -> None:
         elif args.arena_mode == "soft_pairwise":
             title = "Reward-Distilled IRT Ranking"
         else:
-            title = "Reward Regression IRT Ranking"
+            title = "Z-Score Reward Regression IRT Ranking"
         plot_difficulty_and_ability(
             model_params,
             question_params,
