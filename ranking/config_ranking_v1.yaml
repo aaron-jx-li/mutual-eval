@@ -1,0 +1,29 @@
+input:
+  static_jsonl:
+    - results/static_eval/misc_v1/responses.jsonl
+  arena_reward_jsonl:
+    - results/arena_eval/misc_v1/responses.jsonl
+
+training:
+  mode: both-pr  # static | arena | both | arena-pr | both-pr | z-regression | both-z-regression
+             #   ^^^new^^^  arena-pr / both-pr enable the pairwise+regression mode:
+             #              combined BCE(pairwise) + MSE(absolute z-score) loss,
+             #              which identifies b_q (prompt difficulty) from arena data alone.
+  num_epochs: 2000
+  lr: 0.02
+  lambda_static: 1.0
+  lambda_arena: 1.0   # weight on BCE pairwise loss   (pairwise+regression: relative ranking signal)
+  lambda_reg:   1.0   # NEW — weight on MSE regression loss (pairwise+regression: pins b_q baseline)
+                      #       ignored in soft_pairwise and static modes
+  reg_lambda: 0.001
+  bb_ratio: 0.10            # target fraction of both-bad pairs (excluded from arena loss via tie system)
+  tie_ratio: 0.15           # target fraction of tie pairs (excluded from arena loss)
+  both_bad_threshold: -1.5  # fallback if bb_ratio is not set
+  both_bad_mode: zscore
+
+output:
+  output_dir: results/ranking_v1/misc_v1/both-pr
+  save_plot: figures_v1/misc_v1_both-pr.pdf
+  save_pairwise_targets: true
+  no_plot: false
+  quiet: false

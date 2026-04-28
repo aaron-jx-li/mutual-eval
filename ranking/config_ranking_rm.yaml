@@ -1,23 +1,25 @@
 input:
   static_jsonl:
-    - results/static_eval/coding_v0/responses.jsonl
+    # - results/static_eval/misc_v1/responses.jsonl
   arena_reward_jsonl:
-    - results/arena_eval/coding_v0/responses.jsonl
+    - results/arena_eval/generic_v1/responses.jsonl
 
 training:
-  mode: both  # static | arena | both | reward | both-reward
-  num_epochs: 5000
+  mode: arena  # static | arena | both | z-regression | both-z-regression
+  num_epochs: 3000
   lr: 0.02
-  lambda_static: 0.395
+  lambda_static: 1.0
   lambda_arena: 1.0       # arena loss weight; used for pairwise distillation or reward regression
   lambda_bb: 0.2          # only used in soft_pairwise / arena / both mode
-  reg_lambda: 0.0001
-  both_bad_threshold: -1.0  # only used in soft_pairwise / arena / both mode
+  reg_lambda: 0.001
+  bb_ratio: 0.15            # target fraction of both-bad pairs; overrides both_bad_threshold
+  tie_ratio: 0.15           # target fraction of tie pairs
+  both_bad_threshold: -1.5  # fallback if bb_ratio is not set
   both_bad_mode: zscore     # only used in soft_pairwise / arena / both mode
 
 output:
-  output_dir: results/ranking_rm/coding_v0/both
-  save_plot: figures/coding_v0_both.pdf
+  output_dir: results/ranking_rm/generic_v1/arena
+  save_plot: figures/generic_v1_arena.pdf
   save_pairwise_targets: true
   no_plot: false
   quiet: false

@@ -89,9 +89,9 @@ MODEL_SPECS: list[ModelSpec] = [
         "gemini-3.1-pro",
         "google",
         "google",
-        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro",
         "GOOGLE_API_KEY",
-        "gemini/gemini-3.1-pro-preview",
+        "gemini/gemini-3.1-pro",
     ),
     ModelSpec(
         "gemini-2.5-pro",
