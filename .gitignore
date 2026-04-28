@@ -15,8 +15,8 @@ __pycache__/
 results/*
 data/arena_140k.json
 data/arena_140k_math.json
-data/new/**.jsonl
-data/new/**.ipynb
+data/new/v0/
+data/new/v1/
 rm_test.py
 reward_client.py
 mutual_eval/
