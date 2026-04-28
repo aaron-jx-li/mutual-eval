@@ -61,7 +61,7 @@ _BOTH_REF: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# New JSONL-based references (new 15-model data)
+# New JSONL-based references (data/new/v0/)
 # ---------------------------------------------------------------------------
 
 _REF_STATIC_MATH: dict[str, int] = {
@@ -245,6 +245,136 @@ _REF_BOTH_ALL: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# New JSONL-based references (data/new/v1/)
+# ---------------------------------------------------------------------------
+
+_REF_STATIC_MATH_1: dict[str, int] = {
+    "gemini-3.1-pro":            1,
+    "grok-4":                    2,
+    "gemini-2.5-pro":            3,
+    "qwen3-max-thinking":        4,
+    "gpt-5-mini":                5,
+    "gemini-2.5-flash":          6,
+    "claude-opus-4-6":           7,
+    "gpt-5.4":                   8,
+    "claude-sonnet-4-6":         9,
+    "deepseek-v3.2":             10,
+    "gpt-4.1-mini":              11,
+    "mistral-large-3":           12,
+    "claude-haiku-4-5":          13,
+    "gpt-4.1":                   14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_STATIC_CODING_1: dict[str, int] = {
+    "gemini-3.1-pro":            1,
+    "claude-sonnet-4-6":         2,
+    "claude-opus-4-6":           3,
+    "gpt-5.4":                   4,
+    "deepseek-v3.2":             5,
+    "claude-haiku-4-5":          6,
+    "gpt-5-mini":                7,
+    "gemini-2.5-pro":            8,
+    "qwen3-max-thinking":        9,
+    "gemini-2.5-flash":          10,
+    "gpt-4.1":                   11,
+    "gpt-4.1-mini":              12,
+    "grok-4":                    13,
+    "mistral-large-3":           14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_ARENA_MATH_1: dict[str, int] = {
+    "gpt-5.4":                   1,
+    "gemini-3.1-pro":            2,
+    "qwen3-max-thinking":        3,
+    "gemini-2.5-pro":            4,
+    "claude-opus-4-6":           5,
+    "claude-sonnet-4-6":         6,
+    "gemini-2.5-flash":          7,
+    "gpt-4.1-mini":              8,
+    "deepseek-v3.2":             9,
+    "grok-4":                    10,
+    "gpt-4.1":                   11,
+    "mistral-large-3":           12,
+    "gpt-5-mini":                13,
+    "claude-haiku-4-5":          14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_ARENA_CODING_1: dict[str, int] = {
+    "gpt-5.4":                   1,
+    "claude-opus-4-6":           2,
+    "claude-sonnet-4-6":         3,
+    "gemini-3.1-pro":            4,
+    "gemini-2.5-pro":            5,
+    "gemini-2.5-flash":          6,
+    "claude-haiku-4-5":          7,
+    "qwen3-max-thinking":        8,
+    "deepseek-v3.2":             9,
+    "mistral-large-3":           10,
+    "gpt-4.1-mini":              11,
+    "gpt-4.1":                   12,
+    "grok-4":                    13,
+    "gpt-5-mini":                14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_ARENA_GENERIC_1: dict[str, int] = {
+    "claude-opus-4-6":           1,
+    "gpt-5.4":                   2,
+    "claude-sonnet-4-6":         3,
+    "gemini-3.1-pro":            4,
+    "gemini-2.5-pro":            5,
+    "grok-4":                    6,
+    "mistral-large-3":           7,
+    "gemini-2.5-flash":          8,
+    "qwen3-max-thinking":        9,
+    "deepseek-v3.2":             10,
+    "claude-haiku-4-5":          11,
+    "gpt-5-mini":                12,
+    "gpt-4.1":                   13,
+    "gpt-4.1-mini":              14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_BOTH_MATH_1: dict[str, int] = {
+    "gemini-3.1-pro":            1,
+    "grok-4":                    2,
+    "gemini-2.5-pro":            3,
+    "qwen3-max-thinking":        4,
+    "gpt-5-mini":                5,
+    "claude-opus-4-6":           6,
+    "gemini-2.5-flash":          7,
+    "gpt-5.4":                   8,
+    "claude-sonnet-4-6":         9,
+    "deepseek-v3.2":             10,
+    "gpt-4.1-mini":              11,
+    "gpt-4.1":                   12,
+    "claude-haiku-4-5":          13,
+    "mistral-large-3":           14,
+    "llama-4-maverick-instruct": 15,
+}
+
+_REF_BOTH_CODING_1: dict[str, int] = {
+    "claude-opus-4-6":           1,
+    "gpt-5.4":                   2,
+    "claude-sonnet-4-6":         3,
+    "gemini-3.1-pro":            4,
+    "gemini-2.5-pro":            5,
+    "gemini-2.5-flash":          6,
+    "gpt-5-mini":                7,
+    "claude-haiku-4-5":          8,
+    "qwen3-max-thinking":        9,
+    "deepseek-v3.2":             10,
+    "gpt-4.1":                   11,
+    "gpt-4.1-mini":              12,
+    "grok-4":                    13,
+    "mistral-large-3":           14,
+    "llama-4-maverick-instruct": 15,
+}
+
+# ---------------------------------------------------------------------------
 # Lookup tables
 # ---------------------------------------------------------------------------
 
@@ -254,7 +384,7 @@ REFERENCE_RANKINGS: dict[str, dict[str, int]] = {
     "static": _STATIC_REF,
     "arena":  _ARENA_REF,
     "both":   _BOTH_REF,
-    # New JSONL-based
+    # New JSONL-based (data/new/v0/)
     "static_math_v0":   _REF_STATIC_MATH,
     "static_coding_v0": _REF_STATIC_CODING,
     "static_all_v0":    _REF_STATIC_ALL,
@@ -262,6 +392,12 @@ REFERENCE_RANKINGS: dict[str, dict[str, int]] = {
     "arena_coding_v0":  _REF_ARENA_CODING,
     "arena_generic_v0": _REF_ARENA_GENERIC,
     "arena_all_v0":     _REF_ARENA_ALL,
+    # New JSONL-based (data/new/v1/)
+    "v1_static_math":   _REF_STATIC_MATH_1,
+    "v1_static_coding": _REF_STATIC_CODING_1,
+    "v1_arena_math":    _REF_ARENA_MATH_1,
+    "v1_arena_coding":  _REF_ARENA_CODING_1,
+    "v1_arena_generic": _REF_ARENA_GENERIC_1,
 }
 
 # Joint both-reward: (static_stem, arena_stem) → ref dict
@@ -269,4 +405,6 @@ JOINT_REFERENCE_RANKINGS: dict[tuple[str, str], dict[str, int]] = {
     ("static_math_v0",   "arena_math_v0"):   _REF_BOTH_MATH,
     ("static_coding_v0", "arena_coding_v0"): _REF_BOTH_CODING,
     ("static_all_v0",    "arena_all_v0"):    _REF_BOTH_ALL,
+    ("v1_static_math",   "v1_arena_math"):   _REF_BOTH_MATH_1,
+    ("v1_static_coding", "v1_arena_coding"): _REF_BOTH_CODING_1,
 }
