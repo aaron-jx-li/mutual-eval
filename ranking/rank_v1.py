@@ -10,20 +10,22 @@ Key differences from rank_rm.py:
   2. Static items retain the full 2PL parameterisation (θ, b_q, a_q).
   3. No both-bad anchoring loss — tie pairs (|z_i - z_j| < tie_delta) are
      simply excluded from the arena loss.
-  4. z-regression mode: regress a_q*(θ_i - b_q) onto z_{i,q} (identifies b_q).
-  5. pairwise+regression mode: combined loss that identifies both a_q and b_q
+  4. pairwise+regression mode: combined loss that identifies both a_q and b_q
      for arena items without static data:
          L = lambda_arena * BCE(σ(a_q*(θ_i-θ_j)), σ(z_i-z_j))   [relative]
            + lambda_reg   * MSE(a_q*(θ_i-b_q),    z_{i,q})       [absolute]
+  5. reward-sigmoid mode: unified BCE loss using sigmoid soft targets from rewards:
+         L = lambda_reg * BCE(σ(a_q*(θ_i-b_q)), σ(τ·z_{i,q}))
+     where τ is a learned temperature regularised toward 1 (log τ → 0).
 
 Supported modes:
-  static            — static 2PL IRT only
-  arena             — direct pairwise arena IRT only (a_q, no b_q for arena)
-  both              — joint static 2PL + direct pairwise IRT
-  arena-pr          — pairwise+regression arena IRT (a_q and b_q for arena)
-  both-pr           — joint static 2PL + pairwise+regression arena IRT
-  z-regression      — z-score reward regression IRT only
-  both-z-regression — joint static 2PL + z-score reward regression IRT
+  static    — static 2PL IRT only
+  arena     — direct pairwise arena IRT only (a_q, no b_q for arena)
+  both      — joint static 2PL + direct pairwise IRT
+  arena-pr  — pairwise+regression arena IRT (a_q and b_q for arena)
+  both-pr   — joint static 2PL + pairwise+regression arena IRT
+  arena-rs  — reward-sigmoid arena IRT (BCE with σ(τ·z) soft targets; identifies b_q)
+  both-rs   — joint static 2PL + reward-sigmoid arena IRT
 
 Example:
     python ranking/rank_v1.py --config ranking/config_ranking_v1.yaml
@@ -73,22 +75,22 @@ from rank_rm import (
 
 # v1 extends the mode set from rank_rm to add pairwise+regression modes.
 MODE_TO_ARENA_MODE: dict[str, str] = {
-    "static":            "soft_pairwise",
-    "arena":             "soft_pairwise",
-    "both":              "soft_pairwise",
-    "arena-pr":          "pairwise+regression",
-    "both-pr":           "pairwise+regression",
-    "z-regression":      "z-regression",
-    "both-z-regression": "z-regression",
+    "static":   "soft_pairwise",
+    "arena":    "soft_pairwise",
+    "both":     "soft_pairwise",
+    "arena-pr": "pairwise+regression",
+    "both-pr":  "pairwise+regression",
+    "arena-rs": "reward-sigmoid",
+    "both-rs":  "reward-sigmoid",
 }
 
 
 def mode_uses_static(mode: str) -> bool:
-    return mode in {"static", "both", "both-pr", "both-z-regression"}
+    return mode in {"static", "both", "both-pr", "both-rs"}
 
 
 def mode_uses_arena(mode: str) -> bool:
-    return mode in {"arena", "both", "arena-pr", "both-pr", "z-regression", "both-z-regression"}
+    return mode in {"arena", "both", "arena-pr", "both-pr", "arena-rs", "both-rs"}
 
 
 def infer_mode(
@@ -105,11 +107,11 @@ def infer_mode(
             return "both-pr"
         if has_arena_input:
             return "arena-pr"
-    elif configured_arena_mode == "z-regression":
+    elif configured_arena_mode == "reward-sigmoid":
         if has_static_input and has_arena_input:
-            return "both-z-regression"
+            return "both-rs"
         if has_arena_input:
-            return "z-regression"
+            return "arena-rs"
     elif configured_arena_mode == "soft_pairwise":
         if has_static_input and has_arena_input:
             return "both"
@@ -146,8 +148,8 @@ def parse_args() -> argparse.Namespace:
             "'both': joint static + direct pairwise. "
             "'arena-pr': pairwise+regression arena (identifies b_q for arena). "
             "'both-pr': joint static + pairwise+regression. "
-            "'z-regression': z-score reward regression only. "
-            "'both-z-regression': joint static + z-score reward regression."
+            "'arena-rs': reward-sigmoid arena (BCE with σ(τ·z) soft targets; identifies b_q). "
+            "'both-rs': joint static + reward-sigmoid."
         ),
     )
     parser.add_argument("--output-dir", default=None)
@@ -170,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--both-bad-use-raw", action="store_true")
     parser.add_argument("--save-pairwise-targets", action="store_true")
     parser.add_argument("--arena-mode", default=None,
-                        choices=["soft_pairwise", "pairwise+regression", "z-regression"],
+                        choices=["soft_pairwise", "pairwise+regression", "reward-sigmoid"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -279,7 +281,7 @@ def fit_irt_v1(
     arena_mode:
       'soft_pairwise'       — direct pairwise BCE only; arena items have a_q, no b_q.
       'pairwise+regression' — combined BCE + MSE; identifies both a_q and b_q for arena.
-      'z-regression'        — MSE regression onto z-scores; arena items have a_q and b_q.
+      'reward-sigmoid'      — BCE with σ(τ·z) soft targets; learns τ; identifies a_q and b_q.
 
     Returns:
         model_params           — theta per model
@@ -288,8 +290,8 @@ def fit_irt_v1(
         metadata
     """
     static = static_df.copy() if static_df is not None else pd.DataFrame()
-    use_pairwise = arena_mode in ("soft_pairwise", "pairwise+regression")
-    use_regression = arena_mode in ("z-regression", "pairwise+regression")
+    use_pairwise = arena_mode in ("soft_pairwise", "pairwise+regression", "reward-sigmoid")
+    use_regression = arena_mode in ("pairwise+regression", "reward-sigmoid")
     pairwise = pairwise_df.copy() if pairwise_df is not None and use_pairwise else pd.DataFrame()
     reward = reward_df.copy() if reward_df is not None and use_regression else pd.DataFrame()
 
@@ -367,15 +369,20 @@ def fit_irt_v1(
     nn.init.zeros_(k_s.weight)
 
     # Arena: log-discrimination k_a always; b_a when regression signal is present
-    arena_has_difficulty = arena_mode in ("z-regression", "pairwise+regression")
+    arena_has_difficulty = arena_mode in ("pairwise+regression", "reward-sigmoid")
     k_a = nn.Embedding(max(n_arena_q, 1), 1, device=device)
     b_a = nn.Embedding(max(n_arena_q, 1), 1, device=device)
     nn.init.zeros_(k_a.weight)
     nn.init.zeros_(b_a.weight)
 
+    # Learned temperature τ for reward-sigmoid mode (τ = exp(log_tau), regularised toward 1)
+    log_tau = nn.Parameter(torch.zeros(1, device=device))
+
     opt_params = [*theta.parameters(), *b_s.parameters(), *k_s.parameters(), *k_a.parameters()]
     if arena_has_difficulty:
         opt_params += [*b_a.parameters()]
+    if arena_mode == "reward-sigmoid":
+        opt_params += [log_tau]
 
     optimizer = optim.Adam(opt_params, lr=lr)
     bce_logits = nn.BCEWithLogitsLoss()
@@ -389,15 +396,18 @@ def fit_irt_v1(
         y_s_t = torch.tensor(static["judge_result"].values, dtype=torch.float32, device=device)
 
     # --- Arena tensors: soft pairwise (non-tie pairs only) ---
-    m1_t = m2_t = qa_t = soft_t = None
+    m1_t = m2_t = qa_t = soft_t = z_diff_t = None
     if has_pairwise:
         hard = pairwise[~pairwise["tie"]].copy()
         m1_t = torch.tensor(hard["m1_idx"].values, dtype=torch.long, device=device)
         m2_t = torch.tensor(hard["m2_idx"].values, dtype=torch.long, device=device)
         qa_t = torch.tensor(hard["qa_idx"].values, dtype=torch.long, device=device)
         soft_t = torch.tensor(hard["target_prob"].values, dtype=torch.float32, device=device)
+        # z_diff = logit(σ(z_i − z_j)) = z_i − z_j; used in reward-sigmoid mode to apply τ
+        # consistently to both pairwise and regression targets: σ(τ·(z_i−z_j)) vs σ(z_i−z_j)
+        z_diff_t = torch.logit(soft_t.clamp(1e-6, 1.0 - 1e-6))
 
-    # --- Arena tensors: regression (z-regression or pairwise+regression) ---
+    # --- Arena tensors: regression (pairwise+regression or reward-sigmoid) ---
     m_r_t = qa_r_t = z_t = None
     if has_reward:
         m_r_t = torch.tensor(reward["m_idx"].values, dtype=torch.long, device=device)
@@ -414,19 +424,30 @@ def fit_irt_v1(
             logits_s = a_s * (theta(m_s_t).squeeze(-1) - b_s(qs_t).squeeze(-1))
             loss_static = bce_logits(logits_s, y_s_t)
 
-        # --- Pairwise loss (soft_pairwise and pairwise+regression modes) ---
+        # --- Pairwise loss ---
+        # reward-sigmoid: target = σ(τ·(z_i−z_j)) so τ applies uniformly to all z-score signals
+        # all other modes: target = σ(z_i−z_j)
         loss_pairwise = torch.tensor(0.0, device=device)
         if m1_t is not None and len(m1_t):
             a_a = torch.exp(k_a(qa_t).squeeze(-1))
             logits_a = a_a * (theta(m1_t).squeeze(-1) - theta(m2_t).squeeze(-1))
-            loss_pairwise = bce_logits(logits_a, soft_t)
+            if arena_mode == "reward-sigmoid":
+                pairwise_target = torch.sigmoid(torch.exp(log_tau) * z_diff_t)
+                loss_pairwise = bce_logits(logits_a, pairwise_target)
+            else:
+                loss_pairwise = bce_logits(logits_a, soft_t)
 
-        # --- Regression loss (z-regression and pairwise+regression modes) ---
+        # --- Regression loss (pairwise+regression: MSE; reward-sigmoid: BCE with soft target) ---
         loss_regression = torch.tensor(0.0, device=device)
         if m_r_t is not None and len(m_r_t):
             a_a_r = torch.exp(k_a(qa_r_t).squeeze(-1))
-            pred = a_a_r * (theta(m_r_t).squeeze(-1) - b_a(qa_r_t).squeeze(-1))
-            loss_regression = mse(pred, z_t)
+            if arena_mode == "reward-sigmoid":
+                logits_rs = a_a_r * (theta(m_r_t).squeeze(-1) - b_a(qa_r_t).squeeze(-1))
+                soft_rs_target = torch.sigmoid(torch.exp(log_tau) * z_t)
+                loss_regression = bce_logits(logits_rs, soft_rs_target)
+            else:
+                pred = a_a_r * (theta(m_r_t).squeeze(-1) - b_a(qa_r_t).squeeze(-1))
+                loss_regression = mse(pred, z_t)
 
         # Variance-targeting prior on θ: penalise deviation from unit spread rather
         # than shrinking toward zero.  After zero-mean centering E[θ]=0, so
@@ -440,6 +461,8 @@ def fit_irt_v1(
             reg = reg + reg_lambda * (b_s.weight.pow(2).mean() + k_s.weight.pow(2).mean())
         if arena_has_difficulty:
             reg = reg + reg_lambda * b_a.weight.pow(2).mean()
+        if arena_mode == "reward-sigmoid":
+            reg = reg + reg_lambda * log_tau.pow(2)
 
         total = (
             lambda_static * loss_static
@@ -460,12 +483,14 @@ def fit_irt_v1(
                 b_a.weight.sub_(shift)
 
         if verbose and (epoch % 500 == 0 or epoch == num_epochs - 1):
+            tau_str = f"  tau={torch.exp(log_tau).item():.4f}" if arena_mode == "reward-sigmoid" else ""
             print(
                 f"  Epoch {epoch:5d} | "
                 f"static={loss_static.item():.4f}  "
                 f"pairwise={loss_pairwise.item():.4f}  "
                 f"regression={loss_regression.item():.4f}  "
                 f"total={total.item():.4f}"
+                f"{tau_str}"
             )
 
     # --- Extract parameters ---
@@ -531,6 +556,8 @@ def fit_irt_v1(
         "has_static": bool(has_static),
         "has_arena": bool(has_arena),
     }
+    if arena_mode == "reward-sigmoid":
+        metadata["tau"] = float(torch.exp(log_tau).item())
     return model_params, static_question_params, arena_question_params, metadata
 
 
@@ -547,6 +574,7 @@ def compute_metrics(
     *,
     arena_mode: str = "soft_pairwise",
     reward_df: pd.DataFrame | None = None,
+    tau: float = 1.0,
 ) -> dict[str, Any]:
     theta_map = model_params.set_index("model_name")["theta"]
     metrics: dict[str, Any] = {}
@@ -562,8 +590,8 @@ def compute_metrics(
         logits = st["a_q"] * (st["theta"] - st["difficulty_b"])
         metrics["static_accuracy"] = float((logits >= 0).astype(int).eq(st["judge_result"].astype(int)).mean())
 
-    # Arena soft pairwise metrics (soft_pairwise and pairwise+regression modes)
-    if arena_mode in ("soft_pairwise", "pairwise+regression") \
+    # Arena soft pairwise metrics (soft_pairwise, pairwise+regression, and reward-sigmoid modes)
+    if arena_mode in ("soft_pairwise", "pairwise+regression", "reward-sigmoid") \
             and pairwise_df is not None and not pairwise_df.empty \
             and not arena_question_params.empty:
         aq_map = arena_question_params.set_index("question_id")["discrimination_exp_k"]
@@ -595,8 +623,8 @@ def compute_metrics(
         else:
             metrics["arena_hard_pair_accuracy"] = float("nan")
 
-    # Regression metrics (z-regression and pairwise+regression modes)
-    if arena_mode in ("z-regression", "pairwise+regression") \
+    # Regression metrics (pairwise+regression: MSE; reward-sigmoid: BCE logloss)
+    if arena_mode in ("pairwise+regression", "reward-sigmoid") \
             and reward_df is not None and not reward_df.empty \
             and not arena_question_params.empty \
             and "difficulty_b" in arena_question_params.columns:
@@ -607,9 +635,18 @@ def compute_metrics(
         rw["a_q"] = rw["question_id"].map(aq_map["discrimination_exp_k"])
         rw = rw.dropna(subset=["theta", "difficulty_b", "a_q"])
         pred = rw["a_q"] * (rw["theta"] - rw["difficulty_b"])
-        residuals = pred - rw["reward_z"]
-        metrics["arena_z_reward_mse"] = float((residuals ** 2).mean())
-        metrics["arena_z_reward_mae"] = float(residuals.abs().mean())
+        if arena_mode == "reward-sigmoid":
+            pred_prob = 1.0 / (1.0 + np.exp(-pred.to_numpy()))
+            soft_target = 1.0 / (1.0 + np.exp(-tau * rw["reward_z"].to_numpy()))
+            eps = 1e-6
+            metrics["arena_reward_sigmoid_logloss"] = float(-np.mean(
+                soft_target * np.log(pred_prob + eps)
+                + (1.0 - soft_target) * np.log(1.0 - pred_prob + eps)
+            ))
+        else:
+            residuals = pred - rw["reward_z"]
+            metrics["arena_z_reward_mse"] = float((residuals ** 2).mean())
+            metrics["arena_z_reward_mae"] = float(residuals.abs().mean())
 
     return metrics
 
@@ -629,9 +666,8 @@ def plot_difficulty_and_ability(
     """Plot model abilities and item difficulties on the shared latent scale.
 
     Static items always have b_q.  Arena items are included only when
-    difficulty_b is present (i.e. pairwise+regression or z-regression mode).
+    difficulty_b is present (i.e. pairwise+regression or reward-sigmoid mode).
     """
-    # Build the combined question frame: static + arena items that have b_q.
     frames = []
     if not static_question_params.empty:
         frames.append(static_question_params[["benchmark", "difficulty_b"]])
@@ -647,25 +683,47 @@ def plot_difficulty_and_ability(
     colors = plt.cm.tab10.colors[: max(1, len(benchmarks))]
 
     fig, ax = plt.subplots(figsize=(12, 5.5))
-    bins = np.linspace(qr["difficulty_b"].min(), qr["difficulty_b"].max(), 41)
-    centers = (bins[:-1] + bins[1:]) / 2
-    widths = np.diff(bins)
-    bottoms = np.zeros(len(centers))
 
+    # --- Quantile-warped x-axis ---
+    # Bin edges are at equal-quantile intervals in data space, drawn with
+    # equal visual width, so dense regions are visually expanded ("zoomed in").
+    n_bins = 40
+    all_b = qr["difficulty_b"].dropna().values
+    q_edges = np.quantile(all_b, np.linspace(0, 1, n_bins + 1))
+    q_edges = np.unique(q_edges)          # collapse ties (e.g. many identical values)
+    n_bins_eff = len(q_edges) - 1
+
+    # Visual axis: bin i occupies [i, i+1]; bars are centred at i+0.5
+    vis_edges = np.arange(len(q_edges), dtype=float)   # 0, 1, …, n_bins_eff
+    vis_centers = vis_edges[:-1] + 0.5
+
+    def data_to_vis(x: "np.ndarray | float") -> "np.ndarray | float":
+        """Piecewise-linear map from data scale to visual axis position."""
+        return np.interp(x, q_edges, vis_edges)
+
+    bottoms = np.zeros(n_bins_eff)
     for idx, benchmark in enumerate(benchmarks):
         counts, _ = np.histogram(
-            qr.loc[qr["benchmark"] == benchmark, "difficulty_b"], bins=bins
+            qr.loc[qr["benchmark"] == benchmark, "difficulty_b"].dropna(), bins=q_edges
         )
         ax.bar(
-            centers, counts, width=widths, bottom=bottoms,
+            vis_centers, counts, width=1.0, bottom=bottoms,
             color=colors[idx % len(colors)], alpha=0.85, align="center",
             edgecolor="white", linewidth=0.3, label=benchmark,
         )
         bottoms += counts
 
+    # Nice tick values in data space → transform to visual positions
+    locator = matplotlib.ticker.MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
+    tick_vals = np.asarray(locator.tick_values(float(q_edges[0]), float(q_edges[-1])))
+    tick_vals = tick_vals[(tick_vals >= q_edges[0]) & (tick_vals <= q_edges[-1])]
+    ax.set_xticks(data_to_vis(tick_vals))
+    ax.set_xticklabels([f"{v:.2g}" for v in tick_vals])
+    ax.set_xlim(vis_edges[0], vis_edges[-1])
+
     y_top = max(1.0, bottoms.max() * 1.5)
     ax.set_ylim(0, y_top)
-    ax.axvline(0.0, color="black", linestyle=":", linewidth=1.0, alpha=0.35)
+    ax.axvline(data_to_vis(0.0), color="black", linestyle=":", linewidth=1.0, alpha=0.35)
 
     model_colors = plt.cm.Dark2.colors
     benchmark_handles = [
@@ -675,9 +733,10 @@ def plot_difficulty_and_ability(
     model_handles: list[Line2D] = []
     for idx, (_, row) in enumerate(model_params.iterrows()):
         color = model_colors[idx % len(model_colors)]
-        ax.axvline(row["theta"], 0, 0.85, color=color, linestyle="--", linewidth=1.3, alpha=0.9)
+        vx = float(data_to_vis(row["theta"]))
+        ax.axvline(vx, 0, 0.85, color=color, linestyle="--", linewidth=1.3, alpha=0.9)
         ax.text(
-            row["theta"], y_top * (0.88 + 0.03 * (idx % 2)),
+            vx, y_top * (0.88 + 0.03 * (idx % 2)),
             f"{idx + 1}", ha="center", va="bottom", fontsize=8, color=color,
         )
         model_handles.append(Line2D(
@@ -685,7 +744,7 @@ def plot_difficulty_and_ability(
             label=f"{idx + 1}. {row['model_name']}",
         ))
 
-    ax.set_xlabel(r"Latent scale (ability $\theta$ / difficulty $b$)")
+    ax.set_xlabel(r"Latent scale (ability $\theta$ / difficulty $b$) — quantile-warped axis")
     ax.set_ylabel("Number of questions")
     ax.set_title(title)
 
@@ -705,7 +764,11 @@ def plot_difficulty_and_ability(
     plt.tight_layout()
     save_path_obj = Path(save_path)
     save_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path_obj, dpi=500, bbox_inches="tight")
+    # Always save both PDF (vector) and high-res PNG in the same directory.
+    stem = save_path_obj.stem
+    out_dir = save_path_obj.parent
+    plt.savefig(out_dir / f"{stem}.pdf", bbox_inches="tight")
+    plt.savefig(out_dir / f"{stem}.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -761,7 +824,7 @@ def main() -> None:
                 f"reward mean={reward_df['reward_raw'].mean():.3f}, "
                 f"reward std={reward_df['reward_raw'].std(ddof=0):.3f}"
             )
-            if args.arena_mode in ("soft_pairwise", "pairwise+regression"):
+            if args.arena_mode in ("soft_pairwise", "pairwise+regression", "reward-sigmoid"):
                 both_bad_threshold, tie_delta = resolve_pairwise_thresholds(
                     reward_df,
                     bb_ratio=args.bb_ratio,
@@ -786,8 +849,8 @@ def main() -> None:
                 )
                 if args.arena_mode == "pairwise+regression":
                     print(f"  pairwise+regression: reward_df also used for regression loss")
-            else:
-                print("  arena_mode=z-regression: using globally z-scored rewards")
+                elif args.arena_mode == "reward-sigmoid":
+                    print(f"  reward-sigmoid: reward_df also used for BCE σ(τ·z) regression loss")
     elif args.arena_reward_jsonl:
         print(f"Note: ignoring arena_reward_jsonl because mode='{args.mode}' does not use arena data.")
 
@@ -818,6 +881,7 @@ def main() -> None:
         arena_qp,
         arena_mode=args.arena_mode,
         reward_df=reward_df if not reward_df.empty else None,
+        tau=float(fit_meta.get("tau", 1.0)),
     )
 
     output_dir = Path(args.output_dir)
@@ -873,8 +937,10 @@ def main() -> None:
             title = "Direct Pairwise IRT Ranking (v1)"
         elif args.arena_mode == "pairwise+regression":
             title = "Pairwise+Regression IRT Ranking (v1)"
+        elif args.arena_mode == "reward-sigmoid":
+            title = "Reward-Sigmoid IRT Ranking (v1)"
         else:
-            title = "Z-Score Reward Regression IRT Ranking (v1)"
+            title = "IRT Ranking (v1)"
         plot_difficulty_and_ability(
             model_params,
             static_qp,
