@@ -1,0 +1,38 @@
+data:
+  arena_jsonl:
+    - data/hf/v1_arena_math.jsonl
+    - data/hf/v1_arena_coding.jsonl
+    - data/hf/v1_arena_generic.jsonl
+    - data/hf/v1_arena_misc.jsonl
+  reward_normalization: per_source
+
+protocol:
+  n_seeds: 1
+  K_stability: 40
+  replay_order: descending_irt_discrimination
+  methods:
+    - irt_arena
+    - bt_arena
+
+fitting:
+  reference_epochs: 1000
+  reference_lr: 0.02
+  bt_epochs: 1000
+  bt_lr: 0.05
+  irt_reg_lambda: 1.0e-4
+  bt_reg_lambda: 1.0e-4
+  replay_reg_lambda: 1.0e-2
+  theta_pad: 2.0
+  grid_size: 801
+
+output:
+  output_dir: results/cold_start/v1_arena_adaptive
+  figures_dir: figures/cold_start
+
+question_items:
+  reference_dir: results/cold_start/v1_arena_adaptive
+  output_dir: results/cold_start/v1_question_items
+  order_strategy: ability_spread
+  replay_reg_lambda: 1.0e-2
+  b_grid_size: 121
+  k_grid_size: 101
