@@ -12,6 +12,11 @@ __pycache__/
 *.out
 *.log
 results/*
+differential_test/**/result/
+differential_test/**/*.sh
+differential_test/**/*.txt
+differential_test/ranking_rm_results/
+differential_test/hf_dataset/
 data/arena_140k.json
 data/arena_140k_math.json
 rm_test.py
