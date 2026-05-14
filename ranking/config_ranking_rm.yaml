@@ -1,12 +1,12 @@
 input:
   static_jsonl:
-    # - results/static_eval/misc_v1/responses.jsonl
+    - results/static_eval/math_v1/responses.jsonl
   arena_reward_jsonl:
-    - results/arena_eval/generic_v1/responses.jsonl
+    - results/arena_eval/math_v1/responses.jsonl
 
 training:
-  mode: arena  # static | arena | both | z-regression | both-z-regression
-  num_epochs: 3000
+  mode: both  # static | arena | both | z-regression | both-z-regression
+  num_epochs: 2000
   lr: 0.02
   lambda_static: 1.0
   lambda_arena: 1.0       # arena loss weight; used for pairwise distillation or reward regression
@@ -18,8 +18,8 @@ training:
   both_bad_mode: zscore     # only used in soft_pairwise / arena / both mode
 
 output:
-  output_dir: results/ranking_rm/generic_v1/arena
-  save_plot: figures/generic_v1_arena.pdf
+  output_dir: results/ranking_rm/math_v1/both
+  save_plot: figures/math_v1_both.pdf
   save_pairwise_targets: true
   no_plot: false
   quiet: false

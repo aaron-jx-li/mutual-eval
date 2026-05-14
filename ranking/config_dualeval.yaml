@@ -1,0 +1,45 @@
+input:
+  static_jsonl:
+    - results/static_eval/coding_v1/responses.jsonl
+  arena_reward_jsonl:
+    - results/arena_eval/coding_v1/responses.jsonl
+
+training:
+  mode: both        # static | arena | both | BT
+
+  num_epochs: 2000
+  lr: 0.02
+
+  # Loss weights.  Only lambda_arena and lambda_bb apply in arena/both modes.
+  lambda_static: 1.0
+  lambda_arena: 1.0
+  lambda_bb: 0.2    # weight for the both-bad anchoring term
+
+  reg_lambda: 0.01
+
+  # Pairwise threshold configuration (arena / both modes only).
+  #
+  # Both thresholds are derived from the empirical pairwise z-score
+  # distribution so that the actual flagged fractions match the requested
+  # ratios regardless of domain-level reward biases.
+  #
+  # bb_ratio  — target fraction of pairs treated as both-bad.
+  #             Threshold = bb_ratio-th percentile of max(z_i, z_j) over
+  #             all pairs.  Both-bad pairs are ONLY used in the bb anchoring
+  #             loss; they are excluded from the arena BCE loss entirely.
+  #             Set to 0.0 to disable both-bad anchoring.
+  #
+  # tie_ratio — target fraction of pairs treated as ties.
+  #             Threshold = tie_ratio-th percentile of |z_i - z_j| over
+  #             all pairs.  Tie pairs are excluded from both the arena BCE
+  #             loss and the bb anchoring loss.
+  #             Set to 0.0 to disable tie exclusion.
+  bb_ratio: 0.15
+  tie_ratio: 0.15
+
+output:
+  output_dir: results/dualeval/coding_v1/both
+  save_plot: figures/dualeval_coding_v1_both.pdf
+  save_pairwise_targets: true
+  no_plot: false
+  quiet: false

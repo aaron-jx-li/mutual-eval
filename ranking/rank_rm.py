@@ -12,8 +12,8 @@ Supported modes mirror the JSONL-based reward modes in ``ranking.py``:
    - For each question and model pair, define a soft preference target:
        p*_{ijq} = sigmoid(z_{i,q} - z_{j,q})
    - Fit the nested pairwise likelihood:
-       pi_{i,q} = sigmoid(theta_i - b_q)
-       P_hat(i > j | q) = sigmoid(gamma * a_q * (pi_{i,q} - pi_{j,q}))
+       p_{i,q} = sigmoid(a_q * (theta_i - b_q))
+       P_hat(i > j | q) = sigmoid(gamma * (p_{i,q} - p_{j,q}))
    - Optionally apply both-bad anchoring when both reward scores are low.
 
 3. ``z-regression`` / ``both-z-regression``: z-score reward regression IRT
@@ -527,6 +527,10 @@ def fit_joint_reward_distilled_irt(
 
     arena_mode:
       'soft_pairwise' — distil rewards into soft pairwise targets (BCE loss).
+                        p_{i,q} = sigmoid(a_q*(theta_i - b_q));
+                        P(i>j|q) = sigmoid(gamma*(p_{i,q} - p_{j,q})).
+                        a_q controls the slope of the success-probability curve (same as static).
+                        gamma is a single global scaling parameter for pairwise preferences.
       'z-regression'  — regress a_q*(theta_i - b_q) onto globally z-scored rewards (MSE loss).
     """
     static = static_df.copy() if static_df is not None else pd.DataFrame()
@@ -625,8 +629,16 @@ def fit_joint_reward_distilled_irt(
     nn.init.zeros_(b.weight)
     nn.init.zeros_(k.weight)
 
-    # log_gamma is only used in soft_pairwise mode
-    log_gamma = nn.Parameter(torch.tensor(0.0, device=device))
+    # log_gamma is only used in soft_pairwise mode.
+    # Prior centre: log(1/σ′(0)).  Derivation: at equilibrium γ·(p_i−p_j) = z_i−z_j.
+    # By the MVT, p_i−p_j = σ′(c)·(z_i−z_j), so γ = 1/σ′(c).
+    # σ′ is maximised exactly at c=0: σ′(0) = σ(0)·(1−σ(0)) = ½·½ = ¼,
+    # giving γ₀ = 1/σ′(0) = 4 exactly.  This is the minimum possible γ
+    # (achieved when both models straddle b_q) and the correct prior centre
+    # because the variance-targeting on θ and L2 on k keep the model near
+    # this maximum-information operating point.
+    _LOG_GAMMA_0 = -math.log(0.5 * (1.0 - 0.5))  # = log(1/σ′(0)) = log(4), exact
+    log_gamma = nn.Parameter(torch.tensor(_LOG_GAMMA_0, device=device))
     opt_params = [*theta.parameters(), *b.parameters(), *k.parameters()]
     if arena_mode == "soft_pairwise":
         opt_params.append(log_gamma)
@@ -651,12 +663,11 @@ def fit_joint_reward_distilled_irt(
             theta_1 = theta(m1_t).squeeze(-1)
             theta_2 = theta(m2_t).squeeze(-1)
             b_q = b(q_t).squeeze(-1)
-            k_q = k(q_t).squeeze(-1)
-            a_q = torch.exp(k_q)
+            a_q = torch.exp(k(q_t).squeeze(-1))
             gamma = torch.exp(log_gamma)
-            pi_1 = torch.sigmoid(theta_1 - b_q)
-            pi_2 = torch.sigmoid(theta_2 - b_q)
-            arena_logits = gamma * a_q * (pi_1 - pi_2)
+            p_1 = torch.sigmoid(a_q * (theta_1 - b_q))
+            p_2 = torch.sigmoid(a_q * (theta_2 - b_q))
+            arena_logits = gamma * (p_1 - p_2)
             loss_arena = bce_logits(arena_logits, soft_t)
         elif has_arena and arena_mode == "z-regression" and m_r is not None and len(m_r):
             theta_r = theta(m_r).squeeze(-1)
@@ -670,11 +681,12 @@ def fit_joint_reward_distilled_irt(
             theta_1_bb = theta(m1_bb).squeeze(-1)
             theta_2_bb = theta(m2_bb).squeeze(-1)
             b_q_bb = b(q_bb).squeeze(-1)
-            pi_1_bb = torch.sigmoid(theta_1_bb - b_q_bb)
-            pi_2_bb = torch.sigmoid(theta_2_bb - b_q_bb)
+            a_q_bb = torch.exp(k(q_bb).squeeze(-1))
+            p_1_bb = torch.sigmoid(a_q_bb * (theta_1_bb - b_q_bb))
+            p_2_bb = torch.sigmoid(a_q_bb * (theta_2_bb - b_q_bb))
             loss_bb = -(
-                torch.log(1.0 - pi_1_bb + 1e-6).mean()
-                + torch.log(1.0 - pi_2_bb + 1e-6).mean()
+                torch.log(1.0 - p_1_bb + 1e-6).mean()
+                + torch.log(1.0 - p_2_bb + 1e-6).mean()
             )
 
         reg = reg_lambda * (
@@ -683,7 +695,7 @@ def fit_joint_reward_distilled_irt(
             + k.weight.pow(2).mean()
         )
         if arena_mode == "soft_pairwise":
-            reg = reg + reg_lambda * log_gamma.pow(2)
+            reg = reg + reg_lambda * (log_gamma - _LOG_GAMMA_0).pow(2)
         total = lambda_static * loss_static + lambda_arena * loss_arena + lambda_bb * loss_bb + reg
         total.backward()
         optimizer.step()
@@ -783,10 +795,11 @@ def compute_metrics(
         ar["difficulty_b"] = ar["question_id"].map(question_map["difficulty_b"])
         ar["a_q"] = ar["question_id"].map(question_map["discrimination_exp_k"])
         ar = ar.dropna(subset=["theta_1", "theta_2", "difficulty_b", "a_q"])
-        pi1 = 1.0 / (1.0 + np.exp(-(ar["theta_1"] - ar["difficulty_b"])))
-        pi2 = 1.0 / (1.0 + np.exp(-(ar["theta_2"] - ar["difficulty_b"])))
+        a_q = ar["a_q"].to_numpy()
+        p1 = 1.0 / (1.0 + np.exp(-a_q * (ar["theta_1"].to_numpy() - ar["difficulty_b"].to_numpy())))
+        p2 = 1.0 / (1.0 + np.exp(-a_q * (ar["theta_2"].to_numpy() - ar["difficulty_b"].to_numpy())))
         gamma = learned_gamma if learned_gamma is not None else 1.0
-        logits = gamma * ar["a_q"].to_numpy() * (pi1 - pi2)
+        logits = gamma * (p1 - p2)
         pred_prob = 1.0 / (1.0 + np.exp(-logits))
         target = ar["target_prob"].to_numpy()
         eps = 1e-6

@@ -1,29 +1,34 @@
 input:
   static_jsonl:
-    - results/static_eval/misc_v1/responses.jsonl
+    - results/static_eval/coding_v1/responses.jsonl
   arena_reward_jsonl:
-    - results/arena_eval/misc_v1/responses.jsonl
+    - results/arena_eval/coding_v1/responses.jsonl
 
 training:
-  mode: both-pr  # static | arena | both | arena-pr | both-pr | z-regression | both-z-regression
-             #   ^^^new^^^  arena-pr / both-pr enable the pairwise+regression mode:
-             #              combined BCE(pairwise) + MSE(absolute z-score) loss,
-             #              which identifies b_q (prompt difficulty) from arena data alone.
+  mode: both-rs  # static | arena | both | arena-pr | both-pr | arena-rs | both-rs
+             #   arena-pr / both-pr  — pairwise+regression: BCE(pairwise) + MSE(z-score)
+             #   arena-rs / both-rs  — reward-sigmoid: BCE with σ(τ·z) soft targets;
+             #                         τ is a learned temperature (log τ regularised → 0)
   num_epochs: 2000
   lr: 0.02
   lambda_static: 1.0
-  lambda_arena: 1.0   # weight on BCE pairwise loss   (pairwise+regression: relative ranking signal)
-  lambda_reg:   1.0   # NEW — weight on MSE regression loss (pairwise+regression: pins b_q baseline)
-                      #       ignored in soft_pairwise and static modes
-  reg_lambda: 0.001
+  lambda_arena: 1.0   # weight on BCE pairwise loss (all arena modes that include pairwise:
+                      #   soft_pairwise, pairwise+regression, reward-sigmoid)
+  lambda_reg:   1.0   # weight on arena regression loss:
+                      #   pairwise+regression → MSE(a*(θ-b), z)
+                      #   reward-sigmoid      → BCE(σ(a*(θ-b)), σ(τ·z))
+                      #   1:1 with lambda_static is correct — both are BCE mean-reduced,
+                      #   so each example contributes equally; weak-signal arena items
+                      #   (z≈0 → target≈0.5) self-down-weight via the sigmoid gradient
+  reg_lambda: 0.01
   bb_ratio: 0.10            # target fraction of both-bad pairs (excluded from arena loss via tie system)
   tie_ratio: 0.15           # target fraction of tie pairs (excluded from arena loss)
   both_bad_threshold: -1.5  # fallback if bb_ratio is not set
   both_bad_mode: zscore
 
 output:
-  output_dir: results/ranking_v1/misc_v1/both-pr
-  save_plot: figures_v1/misc_v1_both-pr.pdf
+  output_dir: results/ranking_v1/coding_v1/both-rs
+  save_plot: figures_v1/coding_v1_both-rs.pdf
   save_pairwise_targets: true
   no_plot: false
   quiet: false
