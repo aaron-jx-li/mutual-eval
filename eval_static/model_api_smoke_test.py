@@ -46,12 +46,17 @@ class ModelSpec:
     model_id: str
     api_env: str
     litellm_model_id: str | None = None
+    reasoning_effort: str | None = None  # OpenAI reasoning_effort top-level param
+    effort: str | None = None            # Anthropic thinking.budget_tokens trigger
 
 
 MODEL_SPECS: list[ModelSpec] = [
     ModelSpec("gpt-5.4", "openai", "openai", "gpt-5.4", "OPENAI_API_KEY", "openai/gpt-5.4"),
     ModelSpec("gpt-5-mini", "openai", "openai", "gpt-5-mini", "OPENAI_API_KEY", "openai/gpt-5-mini"),
     ModelSpec("gpt-5.1-mini", "openai", "openai", "gpt-5.1-mini", "OPENAI_API_KEY", "openai/gpt-5.1-mini"),
+    ModelSpec("gpt-5.4-mini", "openai", "openai", "gpt-5.4-mini", "OPENAI_API_KEY"),
+    ModelSpec("gpt-5.5", "openai", "openai", "gpt-5.5", "OPENAI_API_KEY"),
+    ModelSpec("gpt-5.5-high", "openai", "openai", "gpt-5.5", "OPENAI_API_KEY", reasoning_effort="high"),
     ModelSpec("gpt-4.1", "openai", "openai", "gpt-4.1", "OPENAI_API_KEY", "openai/gpt-4.1"),
     ModelSpec(
         "gpt-4.1-mini",
@@ -68,6 +73,21 @@ MODEL_SPECS: list[ModelSpec] = [
         "claude-opus-4-6",
         "ANTHROPIC_API_KEY",
         "claude-opus-4-6",
+    ),
+    ModelSpec(
+        "claude-opus-4-7",
+        "anthropic",
+        "anthropic",
+        "claude-opus-4-7",
+        "ANTHROPIC_API_KEY",
+    ),
+    ModelSpec(
+        "claude-opus-4-7-thinking",
+        "anthropic",
+        "anthropic",
+        "claude-opus-4-7",
+        "ANTHROPIC_API_KEY",
+        effort="max",
     ),
     ModelSpec(
         "claude-sonnet-4-6",
@@ -245,6 +265,20 @@ def call_openai_compatible(
     return extract_chat_content(resp.choices[0].message.content)
 
 
+def call_openai_responses(
+    client: OpenAI,
+    model_id: str,
+    prompt: str,
+    *,
+    reasoning_effort: str | None = None,
+) -> str:
+    request_kwargs: dict[str, Any] = {"model": model_id, "input": prompt}
+    if reasoning_effort is not None:
+        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+    resp = client.responses.create(**request_kwargs)
+    return resp.output_text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Smoke test API access for the planned model list.")
     parser.add_argument(
@@ -395,14 +429,22 @@ def call_model(
             text = call_openai_compatible(clients["litellm"], routed_model_id, PROMPT)
 
         elif spec.provider == "openai":
-            text = call_openai_compatible(clients["openai"], spec.model_id, PROMPT)
+            text = call_openai_responses(
+                clients["openai"],
+                spec.model_id,
+                PROMPT,
+                reasoning_effort=spec.reasoning_effort,
+            )
 
         elif spec.provider == "anthropic":
-            resp = clients["anthropic"].messages.create(
-                model=spec.model_id,
-                max_tokens=32,
-                messages=[{"role": "user", "content": PROMPT}],
-            )
+            create_kwargs: dict[str, Any] = {
+                "model": spec.model_id,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": PROMPT}],
+            }
+            if spec.effort:
+                create_kwargs["extra_body"] = {"output_config": {"effort": spec.effort}}
+            resp = clients["anthropic"].messages.create(**create_kwargs)
             text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text").strip()
 
         elif spec.provider == "google":

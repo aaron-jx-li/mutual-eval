@@ -179,6 +179,7 @@ def call_openai_compatible(
     system_prompt: str | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = 2048,
+    generation_timeout: int | None = None,
 ) -> str:
     messages: list[dict[str, str]] = []
     if system_prompt:
@@ -196,11 +197,14 @@ def call_openai_compatible(
             request_kwargs["max_completion_tokens"] = max_tokens
         else:
             request_kwargs["max_tokens"] = max_tokens
-
     try:
-        resp = client.chat.completions.create(**request_kwargs)
+        resp = client.chat.completions.create(
+            **request_kwargs,
+            **({"timeout": generation_timeout} if generation_timeout is not None else {}),
+        )
     except BadRequestError as exc:
         message = str(exc).lower()
+        timeout_kw = {"timeout": generation_timeout} if generation_timeout is not None else {}
         if (
             "max_tokens" in request_kwargs
             and "unsupported" in message
@@ -209,7 +213,7 @@ def call_openai_compatible(
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("max_tokens", None)
             retry_kwargs["max_completion_tokens"] = max_tokens
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         elif (
             "max_completion_tokens" in request_kwargs
             and "unsupported" in message
@@ -218,7 +222,7 @@ def call_openai_compatible(
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("max_completion_tokens", None)
             retry_kwargs["max_tokens"] = max_tokens
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         elif (
             "temperature" in request_kwargs
             and "unsupported" in message
@@ -226,11 +230,31 @@ def call_openai_compatible(
         ):
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("temperature", None)
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         else:
             raise
 
     return extract_chat_content(resp.choices[0].message.content)
+
+
+def call_openai_responses(
+    client: OpenAI,
+    model_id: str,
+    *,
+    user_prompt: str,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    generation_timeout: int | None = None,
+) -> str:
+    request_kwargs: dict[str, Any] = {"model": model_id, "input": user_prompt}
+    if max_output_tokens is not None:
+        request_kwargs["max_output_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+    if generation_timeout is not None:
+        request_kwargs["timeout"] = generation_timeout
+    resp = client.responses.create(**request_kwargs)
+    return resp.output_text
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,6 +397,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
     args.model_max_tokens = {
         key: (int(value) if value is not None else None)
         for key, value in section.get("model_max_tokens", {}).items()
+    }
+    args.model_generation_timeouts = {
+        key: (int(value) if value is not None else None)
+        for key, value in section.get("model_generation_timeouts", {}).items()
     }
     if args.output_dir is None:
         args.output_dir = section.get("output_dir")
@@ -675,6 +703,7 @@ def call_model(
     prompt: str,
     *,
     generation_max_tokens: int | None,
+    generation_timeout: int | None = None,
     use_litellm: bool = False,
     litellm_models: set[str] | None = None,
 ) -> str:
@@ -690,19 +719,21 @@ def call_model(
             user_prompt=prompt,
             temperature=0.0,
             max_tokens=generation_max_tokens,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "openai":
-        return call_openai_compatible(
+        return call_openai_responses(
             clients["openai"],
             spec.model_id,
             user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=generation_max_tokens,
+            max_output_tokens=generation_max_tokens,
+            reasoning_effort=spec.reasoning_effort,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "google":
         # Google's API sends HTTP keepalives while thinking, which resets the
         # httpx read timeout. Enforce a hard wall-clock timeout via a thread.
-        _generation_timeout = clients.get("_generation_timeout")
+        _generation_timeout = generation_timeout or clients.get("_generation_timeout")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
             _fut = _ex.submit(
                 call_openai_compatible,
@@ -723,13 +754,19 @@ def call_model(
             user_prompt=prompt,
             temperature=0.0,
             max_tokens=generation_max_tokens,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "anthropic":
-        resp = clients["anthropic"].messages.create(
-            model=spec.model_id,
-            max_tokens=generation_max_tokens or 8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        anthropic_kwargs: dict[str, Any] = {
+            "model": spec.model_id,
+            "max_tokens": generation_max_tokens or 8192,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if spec.effort:
+            anthropic_kwargs["extra_body"] = {"output_config": {"effort": spec.effort}}
+        if generation_timeout is not None:
+            anthropic_kwargs["timeout"] = generation_timeout
+        resp = clients["anthropic"].messages.create(**anthropic_kwargs)
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
@@ -871,8 +908,10 @@ def evaluate_item(
     judge_model: str,
     completed_keys: set[str],
     generation_max_tokens: int | None,
+    generation_timeout: int,
     generation_retries: int,
     model_max_tokens: dict[str, int | None] | None,
+    model_generation_timeouts: dict[str, int | None] | None,
     use_litellm: bool,
     litellm_models: set[str] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -906,7 +945,9 @@ def evaluate_item(
         }
 
         started = time.time()
-        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
+        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens) or generation_max_tokens
+        per_model_timeout = (model_generation_timeouts or {}).get(model_spec.label)
+        effective_timeout = per_model_timeout if per_model_timeout is not None else generation_timeout
         response_text: str | None = None
         last_generation_error: str | None = None
         for attempt in range(generation_retries + 1):
@@ -917,6 +958,7 @@ def evaluate_item(
                     clients,
                     item["prompt"],
                     generation_max_tokens=effective_max_tokens,
+                    generation_timeout=effective_timeout,
                     use_litellm=use_litellm,
                     litellm_models=litellm_models,
                 )
@@ -1041,6 +1083,7 @@ def main() -> None:
         "generation_max_tokens": args.generation_max_tokens,
         "generation_retries": args.generation_retries,
         "model_max_tokens": args.model_max_tokens,
+        "model_generation_timeouts": args.model_generation_timeouts,
         "use_litellm": args.use_litellm,
         "litellm_models": sorted(litellm_models) if litellm_models is not None else None,
         "max_workers": args.max_workers,
@@ -1097,8 +1140,10 @@ def main() -> None:
                 judge_model=args.judge_model,
                 completed_keys=completed_keys_snapshot,
                 generation_max_tokens=args.generation_max_tokens,
+                generation_timeout=args.generation_timeout,
                 generation_retries=args.generation_retries,
                 model_max_tokens=args.model_max_tokens,
+                model_generation_timeouts=args.model_generation_timeouts,
                 use_litellm=args.use_litellm,
                 litellm_models=litellm_models,
             )
@@ -1115,8 +1160,10 @@ def main() -> None:
                     judge_model=args.judge_model,
                     completed_keys=completed_keys_snapshot,
                     generation_max_tokens=args.generation_max_tokens,
+                    generation_timeout=args.generation_timeout,
                     generation_retries=args.generation_retries,
                     model_max_tokens=args.model_max_tokens,
+                    model_generation_timeouts=args.model_generation_timeouts,
                     use_litellm=args.use_litellm,
                     litellm_models=litellm_models,
                 )

@@ -61,6 +61,10 @@ evaluation:
     claude-haiku-4-5: 56000  # haiku-4-5-20251001 API max output is 64000, below the 65536 global
     gpt-5-mini: ~    # null = no limit; model returns empty responses when capped
     gpt-5.4: ~       # thinking model: exhausts 16384 on hard problems
+    gpt-5.4-mini: ~
+    gpt-5.5: ~
+    gpt-5.5-high: ~
+    claude-opus-4-7-thinking: ~  # extended thinking needs uncapped headroom
     gpt-4.1: 32768
     gpt-4.1-mini: 32768
   reward_timeout: 300
@@ -70,9 +74,14 @@ evaluation:
   models:
     - gpt-5.4
     - gpt-5-mini
+    - gpt-5.4-mini
+    - gpt-5.5
+    - gpt-5.5-high
     - gpt-4.1
     - gpt-4.1-mini
     - claude-opus-4-6
+    - claude-opus-4-7
+    - claude-opus-4-7-thinking
     - claude-sonnet-4-6
     - claude-haiku-4-5
     - gemini-3.1-pro

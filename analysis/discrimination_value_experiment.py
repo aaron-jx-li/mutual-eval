@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Show that learned item discrimination is useful for efficient ranking recovery.
+Show that learned item sharpness is useful for efficient ranking recovery.
 
-For each saved ranking_rm run, this script:
-  1. Plots item difficulty vs. learned discrimination and annotates correlations.
-  2. Selects the top x% most discriminative questions, re-estimates model
-     abilities from only those questions while keeping full-run item parameters
-     fixed, and compares the recovered ranking to the full-question ranking.
+For each saved dualeval run, this script:
+  1. Plots item difficulty vs. learned sharpness and annotates correlations.
+  2. Selects the top x% most discriminative questions using a configurable
+     item-utility criterion, re-estimates model abilities from only those
+     questions while keeping full-run item parameters fixed, and compares the
+     recovered ranking to the full-question ranking.
   3. Adds random-question baselines using both the fixed-item DualEval recovery
      and a direct arena-only BT fit on the same random x% question subsets.
 
 Usage examples:
   python analysis/discrimination_value_experiment.py \
-      --run-dirs results/ranking_rm/math_v1/both \
-      --fractions 0.05 0.10 0.20
+      --run-dirs results/dualeval/coding_v1/arena \
+      --benchmarks Arena \
+      --fractions 0.05 0.10 0.20 \
+      --selection-criterion effective \
+      --output-dir results/dualeval_baselines/coding_v1_arena_efficiency
 
   python analysis/discrimination_value_experiment.py \
-      --runs-root results/ranking_rm \
-      --output-dir results/discrimination_value
+      --runs-root results/dualeval \
+      --output-dir results/dualeval_baselines
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FRACTIONS = [0.025, 0.05, 0.10, 0.20, 0.30, 0.50, 1.00]
 DEFAULT_RANDOM_SEEDS = [0, 1, 2]
+SELECTION_CRITERIA = {"raw", "effective", "fisher", "mean"}
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -219,59 +224,147 @@ def ranking_metrics(ref_params: pd.DataFrame, sample_params: pd.DataFrame, *, to
     }
 
 
-def plot_difficulty_discrimination(question_params: pd.DataFrame, *, save_path: Path, title: str) -> dict[str, float]:
-    qp = question_params.dropna(subset=["difficulty_b", "discrimination_exp_k"]).copy()
-    if qp.empty:
-        return {"pearson": float("nan"), "spearman": float("nan"), "n_questions": 0.0}
-    qp["log_discrimination"] = np.log(qp["discrimination_exp_k"].clip(lower=1e-12))
-    pearson, _ = pearsonr(qp["difficulty_b"], qp["log_discrimination"]) if len(qp) > 1 else (float("nan"), None)
-    spearman, _ = spearmanr(qp["difficulty_b"], qp["log_discrimination"]) if len(qp) > 1 else (float("nan"), None)
+_CONTRAST_COLORS = [
+    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3",
+    "#FF7F00", "#A65628", "#F781BF", "#666666",
+    "#66C2A5", "#FC8D62",
+]
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.2))
+
+_CRITERION_YLABEL: dict[str, str] = {
+    "raw":       r"Sharpness $a_q$",
+    "effective": r"Eff. disc. $a_q \cdot p_q(1-p_q)$",
+    "fisher":    r"Fisher info $a_q^2 \cdot p_q(1-p_q)$",
+    "mean":      r"Mean Fisher $\mathbb{E}_m[a_q p_{mq}(1\!-\!p_{mq})]$",
+}
+
+
+def _compute_selection_scores(
+    qp: pd.DataFrame,
+    criterion: str,
+    model_params: pd.DataFrame | None,
+) -> np.ndarray:
+    a = qp["sharpness_exp_k"].astype(float).to_numpy()
+    b = qp["difficulty_b"].astype(float).to_numpy()
+    if criterion == "raw" or model_params is None or model_params.empty:
+        return a
+    if criterion in {"effective", "fisher"}:
+        theta_ref = float(model_params["theta"].median())
+        p = 1.0 / (1.0 + np.exp(-a * (theta_ref - b)))
+        return (a ** 2) * p * (1.0 - p) if criterion == "fisher" else a * p * (1.0 - p)
+    # mean
+    theta_vals = model_params["theta"].astype(float).to_numpy()
+    logits = np.outer(theta_vals, a) - (a * b)[None, :]
+    p = 1.0 / (1.0 + np.exp(-logits))
+    return (a[None, :] * p * (1.0 - p)).mean(axis=0)
+
+
+def _style_ax(ax: plt.Axes) -> None:
+    ax.set_facecolor("#f8f8f8")
+    ax.grid(color="white", linewidth=1.0, zorder=0)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#cccccc")
+
+
+def _scatter_by_benchmark(ax: plt.Axes, qp: pd.DataFrame, y_col: str) -> list[str]:
     benchmarks = sorted(qp["benchmark"].fillna("unknown").unique())
-    cmap = plt.get_cmap("tab10", max(1, len(benchmarks)))
     for idx, benchmark in enumerate(benchmarks):
+        color = _CONTRAST_COLORS[idx % len(_CONTRAST_COLORS)]
         part = qp[qp["benchmark"].fillna("unknown") == benchmark]
         ax.scatter(
             part["difficulty_b"],
-            part["log_discrimination"],
-            s=24,
-            alpha=0.72,
-            color=cmap(idx),
+            part[y_col],
+            s=28, alpha=0.75, color=color,
             label=str(benchmark),
-            edgecolors="none",
+            edgecolors="white", linewidths=0.4, zorder=3,
+        )
+    return benchmarks
+
+
+def _annotate(ax: plt.Axes, x: np.ndarray, y: np.ndarray, n: int) -> None:
+    if len(x) > 1:
+        pearson, _ = pearsonr(x, y)
+        spearman, _ = spearmanr(x, y)
+        ax.text(
+            0.03, 0.97,
+            f"Pearson $r$={pearson:.3f}\nSpearman $\\rho$={spearman:.3f}\n$n$={n}",
+            transform=ax.transAxes, ha="left", va="top", fontsize=9,
+            bbox={"boxstyle": "round,pad=0.4", "facecolor": "white",
+                  "alpha": 0.9, "linewidth": 0.6, "edgecolor": "#cccccc"},
         )
 
-    ax.axhline(0.0, color="gray", linestyle=":", linewidth=0.8)
-    ax.axvline(0.0, color="gray", linestyle=":", linewidth=0.8)
-    ax.set_xlabel(r"Item difficulty $b_q$")
-    ax.set_ylabel(r"Log discrimination $\log a_q$")
-    ax.set_title(title)
-    ax.text(
-        0.03,
-        0.97,
-        f"Pearson r={pearson:.3f}\nSpearman rho={spearman:.3f}\nn={len(qp)}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "linewidth": 0.5},
-    )
-    ax.legend(fontsize=8, frameon=True, loc="best")
+
+def plot_difficulty_sharpness(
+    question_params: pd.DataFrame,
+    *,
+    save_path: Path,
+    title: str,
+    model_params: pd.DataFrame | None = None,
+    criterion: str = "effective",
+) -> dict[str, float]:
+    qp = question_params.dropna(subset=["difficulty_b", "sharpness_exp_k"]).copy()
+    if qp.empty:
+        return {"pearson": float("nan"), "spearman": float("nan"), "n_questions": 0.0}
+
+    qp["log_sharpness"] = np.log(qp["sharpness_exp_k"].clip(lower=1e-12))
+    pearson, _ = pearsonr(qp["difficulty_b"], qp["log_sharpness"]) if len(qp) > 1 else (float("nan"), None)
+    spearman, _ = spearmanr(qp["difficulty_b"], qp["log_sharpness"]) if len(qp) > 1 else (float("nan"), None)
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 5.2))
+
+    _style_ax(ax)
+    benchmarks = _scatter_by_benchmark(ax, qp, "log_sharpness")
+    ax.axhline(0.0, color="#999999", linestyle="--", linewidth=0.9, zorder=2)
+    ax.axvline(0.0, color="#999999", linestyle="--", linewidth=0.9, zorder=2)
+    ax.set_xlabel(r"Item difficulty $b_q$", fontsize=11)
+    ax.set_ylabel(r"Log sharpness $\log a_q$", fontsize=11)
+    ax.set_title("Difficulty vs Sharpness", fontsize=11, pad=8)
+    _annotate(ax, qp["difficulty_b"].to_numpy(), qp["log_sharpness"].to_numpy(), len(qp))
+    if len(benchmarks) > 1:
+        ax.legend(fontsize=9, frameon=True, framealpha=0.9, edgecolor="#cccccc", loc="best")
+
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=180, bbox_inches="tight")
+    fig.savefig(save_path, format="pdf", bbox_inches="tight")
     plt.close(fig)
     return {"pearson": float(pearson), "spearman": float(spearman), "n_questions": float(len(qp))}
 
 
-def select_top_discrimination(question_params: pd.DataFrame, fraction: float) -> pd.DataFrame:
+def select_top_sharpness(
+    question_params: pd.DataFrame,
+    fraction: float,
+    model_params: pd.DataFrame | None = None,
+    criterion: str = "effective",
+) -> pd.DataFrame:
     if not 0 < fraction <= 1:
         raise ValueError(f"Fractions must be in (0, 1], got {fraction}")
+    if criterion not in SELECTION_CRITERIA:
+        raise ValueError(f"Unknown selection criterion '{criterion}'. Choose from: {sorted(SELECTION_CRITERIA)}")
     n_total = len(question_params)
     n_select = max(1, min(n_total, int(math.ceil(fraction * n_total))))
+    qp = question_params.copy()
+    if criterion == "raw" or model_params is None or model_params.empty or "theta" not in model_params.columns:
+        sort_col = "sharpness_exp_k"
+    else:
+        a = qp["sharpness_exp_k"].astype(float).to_numpy()
+        b = qp["difficulty_b"].astype(float).to_numpy()
+        if criterion in {"effective", "fisher"}:
+            theta_ref = float(model_params["theta"].median())
+            p = 1.0 / (1.0 + np.exp(-a * (theta_ref - b)))
+            if criterion == "effective":
+                qp["_selection_score"] = a * p * (1.0 - p)
+            else:
+                qp["_selection_score"] = (a ** 2) * p * (1.0 - p)
+        else:
+            theta_values = model_params["theta"].astype(float).to_numpy()
+            logits = np.outer(theta_values, a) - (a * b)[None, :]
+            p = 1.0 / (1.0 + np.exp(-logits))
+            qp["_selection_score"] = (a[None, :] * p * (1.0 - p)).mean(axis=0)
+        sort_col = "_selection_score"
     return (
-        question_params.sort_values("discrimination_exp_k", ascending=False)
+        qp.sort_values(sort_col, ascending=False)
         .head(n_select)
+        .drop(columns=["_selection_score"], errors="ignore")
         .copy()
         .reset_index(drop=True)
     )
@@ -298,7 +391,7 @@ def fit_abilities_with_fixed_items(
 
     q_to_idx = {str(qid): idx for idx, qid in enumerate(selected_qp["question_id"].astype(str))}
     b_values = selected_qp["difficulty_b"].astype(float).to_numpy()
-    a_values = selected_qp["discrimination_exp_k"].astype(float).to_numpy()
+    a_values = selected_qp["sharpness_exp_k"].astype(float).to_numpy()
 
     static = static_df[
         static_df["question_id"].astype(str).isin(selected_question_ids)
@@ -430,7 +523,7 @@ def fit_bt_with_selected_arena_questions(
     if pairwise.empty:
         return pd.DataFrame(columns=["model_name", "theta"])
 
-    # Direct BT is the arena-only baseline: no item difficulty/discrimination.
+    # Direct BT is the arena-only baseline: no item parameters used.
     device = torch.device("cpu")
     theta = nn.Embedding(len(model_names), 1, device=device)
     nn.init.zeros_(theta.weight)
@@ -445,6 +538,101 @@ def fit_bt_with_selected_arena_questions(
         optimizer.zero_grad()
         logits = theta(m1).squeeze(-1) - theta(m2).squeeze(-1)
         loss = bce_logits(logits, target) + reg_lambda * theta.weight.pow(2).mean()
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            theta.weight.sub_(theta.weight.mean())
+
+    theta_np = theta.weight.detach().cpu().numpy().squeeze(-1)
+    return (
+        pd.DataFrame({"model_name": model_names, "theta": theta_np})
+        .sort_values("theta", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def fit_2pl_bt_from_scratch(
+    *,
+    full_model_params: pd.DataFrame,
+    static_df: pd.DataFrame,
+    pairwise_df: pd.DataFrame,
+    selected_question_ids: set[str],
+    epochs: int,
+    lr: float,
+    reg_lambda: float,
+) -> pd.DataFrame:
+    """2PL IRT on static questions + BT on arena questions, all learned from scratch."""
+    model_names = full_model_params["model_name"].astype(str).tolist()
+    model_to_idx = {model: idx for idx, model in enumerate(model_names)}
+
+    static = static_df[
+        static_df["question_id"].astype(str).isin(selected_question_ids)
+        & static_df["model_name"].astype(str).isin(model_to_idx)
+    ].copy()
+    pairwise = pairwise_df[
+        pairwise_df["question_id"].astype(str).isin(selected_question_ids)
+        & pairwise_df["model_1"].astype(str).isin(model_to_idx)
+        & pairwise_df["model_2"].astype(str).isin(model_to_idx)
+    ].copy()
+    if not pairwise.empty and "tie" in pairwise.columns:
+        pairwise = pairwise[~pairwise["tie"].astype(bool)].copy()
+
+    if static.empty and pairwise.empty:
+        return pd.DataFrame(columns=["model_name", "theta"])
+
+    device = torch.device("cpu")
+    theta = nn.Embedding(len(model_names), 1, device=device)
+    nn.init.zeros_(theta.weight)
+    trainable = list(theta.parameters())
+
+    tensors: dict[str, torch.Tensor] = {}
+
+    if not static.empty:
+        static_qids = static["question_id"].astype(str).unique().tolist()
+        static_q_to_idx = {qid: i for i, qid in enumerate(static_qids)}
+        b_static = nn.Embedding(len(static_qids), 1, device=device)
+        log_a_static = nn.Embedding(len(static_qids), 1, device=device)
+        nn.init.zeros_(b_static.weight)
+        nn.init.zeros_(log_a_static.weight)  # initialises a_q = exp(0) = 1
+        trainable += list(b_static.parameters()) + list(log_a_static.parameters())
+        tensors["static_m"] = torch.tensor(
+            static["model_name"].map(model_to_idx).to_numpy(), dtype=torch.long, device=device
+        )
+        tensors["static_q"] = torch.tensor(
+            static["question_id"].astype(str).map(static_q_to_idx).to_numpy(), dtype=torch.long, device=device
+        )
+        tensors["static_y"] = torch.tensor(
+            static["judge_result"].astype(float).to_numpy(), dtype=torch.float32, device=device
+        )
+
+    if not pairwise.empty:
+        tensors["pair_m1"] = torch.tensor(
+            pairwise["model_1"].map(model_to_idx).to_numpy(), dtype=torch.long, device=device
+        )
+        tensors["pair_m2"] = torch.tensor(
+            pairwise["model_2"].map(model_to_idx).to_numpy(), dtype=torch.long, device=device
+        )
+        tensors["pair_y"] = torch.tensor(
+            pairwise["target_prob"].astype(float).to_numpy(), dtype=torch.float32, device=device
+        )
+
+    optimizer = optim.Adam(trainable, lr=lr)
+    bce_logits = nn.BCEWithLogitsLoss()
+
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss = torch.tensor(0.0, device=device)
+        if "static_m" in tensors:
+            q_idx = tensors["static_q"]
+            a = torch.exp(log_a_static(q_idx)).squeeze(-1)
+            b = b_static(q_idx).squeeze(-1)
+            logits = a * (theta(tensors["static_m"]).squeeze(-1) - b)
+            loss = loss + bce_logits(logits, tensors["static_y"])
+            loss = loss + reg_lambda * (b_static.weight.pow(2).mean() + log_a_static.weight.pow(2).mean())
+        if "pair_m1" in tensors:
+            logits_bt = theta(tensors["pair_m1"]).squeeze(-1) - theta(tensors["pair_m2"]).squeeze(-1)
+            loss = loss + bce_logits(logits_bt, tensors["pair_y"])
+        loss = loss + reg_lambda * theta.weight.pow(2).mean()
         loss.backward()
         optimizer.step()
         with torch.no_grad():
@@ -494,21 +682,24 @@ def subset_item_stats(question_params: pd.DataFrame, selected_question_ids: set[
     if subset.empty:
         return {
             "mean_difficulty_b": float("nan"),
-            "mean_discrimination_exp_k": float("nan"),
+            "mean_sharpness_exp_k": float("nan"),
             "median_difficulty_b": float("nan"),
-            "median_discrimination_exp_k": float("nan"),
+            "median_sharpness_exp_k": float("nan"),
         }
     return {
         "mean_difficulty_b": float(subset["difficulty_b"].mean()),
-        "mean_discrimination_exp_k": float(subset["discrimination_exp_k"].mean()),
+        "mean_sharpness_exp_k": float(subset["sharpness_exp_k"].mean()),
         "median_difficulty_b": float(subset["difficulty_b"].median()),
-        "median_discrimination_exp_k": float(subset["discrimination_exp_k"].median()),
+        "median_sharpness_exp_k": float(subset["sharpness_exp_k"].median()),
     }
 
 
 def summarise_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
     return (
-        metrics_df.groupby(["selection_strategy", "target_fraction", "n_questions", "n_total_questions"], as_index=False)
+        metrics_df.groupby(
+            ["selection_criterion", "selection_strategy", "target_fraction", "n_questions", "n_total_questions"],
+            as_index=False,
+        )
         .agg(
             actual_fraction=("actual_fraction", "mean"),
             spearman_mean=("spearman", "mean"),
@@ -524,17 +715,17 @@ def summarise_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def plot_recovery(summary_df: pd.DataFrame, *, save_path: Path, title: str, top_k: int) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0), sharex=True)
+def plot_recovery(summary_df: pd.DataFrame, *, save_path: Path, title: str) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.0), sharex=True)
     metrics = [
         ("spearman_mean", "spearman_std", "Spearman rho"),
         ("kendall_mean", "kendall_std", "Kendall tau"),
-        ("top_k_retention_mean", None, f"Top-{top_k} retention"),
     ]
     labels = {
-        "discrimination_top": "Top discrimination (DualEval)",
+        "sharpness_top": "Top sharpness (DualEval)",
         "random": "Random (DualEval)",
         "random_bt": "Random (BT)",
+        "random_2pl_bt": "Random (2PL+BT)",
     }
     for ax, (mean_col, std_col, ylabel) in zip(axes, metrics):
         for strategy, part in summary_df.groupby("selection_strategy", sort=False):
@@ -554,7 +745,7 @@ def plot_recovery(summary_df: pd.DataFrame, *, save_path: Path, title: str, top_
     fig.suptitle(title)
     fig.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, dpi=180, bbox_inches="tight")
+    fig.savefig(save_path, format="pdf", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -593,17 +784,22 @@ def run_single_experiment(
     fractions: list[float],
     random_seeds: list[int],
     benchmarks: set[str] | None,
+    selection_criterion: str,
     top_k: int,
     epochs: int,
     lr: float,
     reg_lambda: float,
 ) -> pd.DataFrame:
     rel_name = run_dir.relative_to(REPO_ROOT / "results" / "ranking_rm") if run_dir.is_relative_to(REPO_ROOT / "results" / "ranking_rm") else run_dir.name
-    run_output = output_dir / rel_name
+    filter_label = "_".join(sorted(benchmarks)) if benchmarks else "both"
+    run_label = f"{filter_label.lower()}_{selection_criterion}"
+    run_output = output_dir / run_label
     run_output.mkdir(parents=True, exist_ok=True)
 
     model_params = pd.read_csv(run_dir / "model_ranking.csv")
-    question_params = pd.read_csv(run_dir / "question_ranking.csv")
+    question_params = pd.read_csv(run_dir / "question_ranking.csv").rename(
+        columns={"discrimination_exp_k": "sharpness_exp_k"}
+    )
     if benchmarks:
         question_params = question_params[
             question_params["benchmark"].astype(str).isin(benchmarks)
@@ -613,14 +809,15 @@ def run_single_experiment(
     with (run_dir / "run_summary.json").open("r", encoding="utf-8") as fh:
         run_summary = json.load(fh)
 
-    filter_label = "_".join(sorted(benchmarks)) if benchmarks else "all_questions"
-    corr = plot_difficulty_discrimination(
+    corr = plot_difficulty_sharpness(
         question_params,
-        save_path=run_output / f"difficulty_vs_discrimination_{filter_label}.png",
-        title=f"Difficulty vs. Discrimination: {rel_name} ({filter_label})",
+        save_path=run_output / f"difficulty_vs_sharpness_{filter_label}.pdf",
+        title=f"Difficulty vs. Sharpness — {rel_name} ({filter_label})",
+        model_params=model_params,
+        criterion=selection_criterion,
     )
     pd.DataFrame([{**corr, "run_dir": str(run_dir), "question_filter": filter_label}]).to_csv(
-        run_output / f"difficulty_discrimination_correlation_{filter_label}.csv",
+        run_output / f"difficulty_sharpness_correlation_{filter_label}.csv",
         index=False,
     )
 
@@ -629,10 +826,40 @@ def run_single_experiment(
         print(f"Skipping subset recovery for {run_dir}: no saved/input response data found.", flush=True)
         return pd.DataFrame()
 
+    has_both = not static_df.empty and not pairwise_df.empty
     all_qids = question_params["question_id"].astype(str).tolist()
+
+    # Pre-compute full-data reference ranking for the alt baseline so each
+    # method is evaluated against its own full-data fit, not DualEval's.
+    print(f"  Fitting full-data alt reference ({('2PL+BT' if has_both else 'BT')})...", flush=True)
+    if has_both:
+        alt_ref_params = fit_2pl_bt_from_scratch(
+            full_model_params=model_params,
+            static_df=static_df,
+            pairwise_df=pairwise_df,
+            selected_question_ids=set(all_qids),
+            epochs=epochs,
+            lr=lr,
+            reg_lambda=reg_lambda,
+        )
+    else:
+        alt_ref_params = fit_bt_with_selected_arena_questions(
+            full_model_params=model_params,
+            pairwise_df=pairwise_df,
+            selected_question_ids=set(all_qids),
+            epochs=epochs,
+            lr=lr,
+            reg_lambda=reg_lambda,
+        )
+
     rows: list[dict[str, Any]] = []
     for fraction in fractions:
-        selected = select_top_discrimination(question_params, fraction)
+        selected = select_top_sharpness(
+            question_params,
+            fraction,
+            model_params=model_params,
+            criterion=selection_criterion,
+        )
         selected_ids = set(selected["question_id"].astype(str))
         selected_stats = {
             **subset_item_stats(question_params, selected_ids),
@@ -654,7 +881,8 @@ def run_single_experiment(
         rows.append(
             {
                 "run_dir": str(run_dir),
-                "selection_strategy": "discrimination_top",
+                "selection_criterion": selection_criterion,
+                "selection_strategy": "sharpness_top",
                 "target_fraction": fraction,
                 "actual_fraction": len(selected_ids) / len(all_qids),
                 "n_questions": len(selected_ids),
@@ -664,7 +892,7 @@ def run_single_experiment(
                 **metrics,
             }
         )
-        selected.to_csv(run_output / f"top_discrimination_questions_{fraction:.3f}.csv", index=False)
+        selected.to_csv(run_output / f"top_sharpness_questions_{fraction:.3f}.csv", index=False)
 
         for seed in random_seeds:
             rng = np.random.default_rng(seed)
@@ -689,6 +917,7 @@ def run_single_experiment(
             rows.append(
                 {
                     "run_dir": str(run_dir),
+                    "selection_criterion": selection_criterion,
                     "selection_strategy": "random",
                     "target_fraction": fraction,
                     "actual_fraction": len(random_ids) / len(all_qids),
@@ -699,33 +928,46 @@ def run_single_experiment(
                     **random_metrics,
                 }
             )
-            recovered_random_bt = fit_bt_with_selected_arena_questions(
-                full_model_params=model_params,
-                pairwise_df=pairwise_df,
-                selected_question_ids=random_ids,
-                epochs=epochs,
-                lr=lr,
-                reg_lambda=reg_lambda,
-            )
-            random_bt_metrics = ranking_metrics(model_params, recovered_random_bt, top_k=top_k)
+            if has_both:
+                recovered_alt = fit_2pl_bt_from_scratch(
+                    full_model_params=model_params,
+                    static_df=static_df,
+                    pairwise_df=pairwise_df,
+                    selected_question_ids=random_ids,
+                    epochs=epochs,
+                    lr=lr,
+                    reg_lambda=reg_lambda,
+                )
+                alt_strategy = "random_2pl_bt"
+            else:
+                recovered_alt = fit_bt_with_selected_arena_questions(
+                    full_model_params=model_params,
+                    pairwise_df=pairwise_df,
+                    selected_question_ids=random_ids,
+                    epochs=epochs,
+                    lr=lr,
+                    reg_lambda=reg_lambda,
+                )
+                alt_strategy = "random_bt"
+            alt_metrics = ranking_metrics(alt_ref_params, recovered_alt, top_k=top_k)
             rows.append(
                 {
                     "run_dir": str(run_dir),
-                    "selection_strategy": "random_bt",
+                    "selection_criterion": selection_criterion,
+                    "selection_strategy": alt_strategy,
                     "target_fraction": fraction,
                     "actual_fraction": len(random_ids) / len(all_qids),
                     "n_questions": len(random_ids),
                     "n_total_questions": len(all_qids),
                     "seed": seed,
                     **random_stats,
-                    **random_bt_metrics,
+                    **alt_metrics,
                 }
             )
         print(
             f"{rel_name}: top {len(selected_ids)}/{len(all_qids)} questions "
-            f"({len(selected_ids) / len(all_qids):.1%}) -> "
-            f"rho={metrics['spearman']:.3f}, tau={metrics['kendall']:.3f}, "
-            f"top{top_k}={metrics['top_k_retention']:.3f}",
+            f"({len(selected_ids) / len(all_qids):.1%}, criterion={selection_criterion}) -> "
+            f"rho={metrics['spearman']:.3f}, tau={metrics['kendall']:.3f}",
             flush=True,
         )
 
@@ -735,9 +977,8 @@ def run_single_experiment(
     summary_df.to_csv(run_output / f"subset_recovery_{filter_label}_summary.csv", index=False)
     plot_recovery(
         summary_df,
-        save_path=run_output / f"subset_recovery_{filter_label}.png",
-        title=f"Ranking Recovery from Discriminative Questions: {rel_name} ({filter_label})",
-        top_k=top_k,
+        save_path=run_output / f"subset_recovery_{filter_label}.pdf",
+        title=f"Ranking Recovery from Discriminative Questions: ({selection_criterion})",
     )
     return metrics_df
 
@@ -760,7 +1001,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=REPO_ROOT / "results" / "discrimination_value",
+        default=REPO_ROOT / "results" / "sharpness_value",
     )
     parser.add_argument("--fractions", nargs="+", type=float, default=DEFAULT_FRACTIONS)
     parser.add_argument(
@@ -768,6 +1009,17 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Restrict question selection to benchmarks such as Arena, hle-math, olympiad-math.",
+    )
+    parser.add_argument(
+        "--selection-criterion",
+        choices=sorted(SELECTION_CRITERIA),
+        default="effective",
+        help=(
+            "Question selection score: raw=a_q (raw sharpness); "
+            "effective=a*p*(1-p) at median theta; "
+            "fisher=a^2*p*(1-p) at median theta; "
+            "mean=mean over all model thetas of a*p*(1-p)."
+        ),
     )
     parser.add_argument(
         "--random-seeds",
@@ -801,6 +1053,7 @@ def main() -> None:
             fractions=args.fractions,
             random_seeds=args.random_seeds,
             benchmarks=benchmarks,
+            selection_criterion=args.selection_criterion,
             top_k=args.top_k,
             epochs=args.epochs,
             lr=args.lr,

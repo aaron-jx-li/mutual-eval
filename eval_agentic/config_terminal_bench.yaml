@@ -13,7 +13,7 @@
 #     --models gpt-4.1-mini --max-tasks 3 --eval-runs 1
 
 evaluation:
-  output_dir: results/agentic_eval/terminal_bench_2
+  output_dir: results/agentic_eval/terminal_bench_2_v2
 
   # Terminal-Bench 2.0 task set. Harbor's --dataset arg understands
   # name@version and auto-downloads into its local cache.
@@ -54,6 +54,8 @@ evaluation:
   model_agent_kwargs_overrides:
     gpt-5.4:
       reasoning_effort: medium
+    gpt-5.5-high:
+      reasoning_effort: high
 
   # Model routing. Harbor/terminus-2 invoke LiteLLM under the hood, so
   # provider-prefixed ids (openai/gpt-5.4, anthropic/claude-opus-4-6, ...)
@@ -84,12 +86,17 @@ evaluation:
   native_models:
     - gpt-5.4
     - gpt-5-mini
+    - gpt-5.4-mini
+    - gpt-5.5
+    - gpt-5.5-high
     - gpt-4.1
     - gpt-4.1-mini
     - gemini-3.1-pro
     - gemini-2.5-pro
     - gemini-2.5-flash
     - claude-opus-4-6
+    - claude-opus-4-7
+    - claude-opus-4-7-thinking
     - claude-sonnet-4-6
     - claude-haiku-4-5
     - grok-4
@@ -111,13 +118,17 @@ evaluation:
     # Avoid LiteLLM "model not mapped" warnings seen with x-ai/grok-4.20-beta.
     grok-4: "openrouter/x-ai/grok-4"
 
-  # Same 15-model roster as eval_static/config_static_coding.yaml.
   models:
     # - gpt-5.4
     # - gpt-5-mini
+    # - gpt-5.4-mini
+    # - gpt-5.5
+    # - gpt-5.5-high
     # - gpt-4.1
     # - gpt-4.1-mini
     # - claude-opus-4-6
+    # - claude-opus-4-7
+    # - claude-opus-4-7-thinking
     # - claude-sonnet-4-6
     # - claude-haiku-4-5
     - gemini-3.1-pro

@@ -107,13 +107,17 @@ ROUTE_NATIVE = "native"
 ROUTE_VALUES = (ROUTE_LITELLM, ROUTE_NATIVE)
 
 
-# Same 15 labels used by eval_static/config_static_coding.yaml.
 DEFAULT_ROSTER: list[str] = [
     "gpt-5.4",
     "gpt-5-mini",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5.5-high",
     "gpt-4.1",
     "gpt-4.1-mini",
     "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-7-thinking",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "gemini-3.1-pro",

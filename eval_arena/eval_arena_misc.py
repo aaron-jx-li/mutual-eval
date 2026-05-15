@@ -383,7 +383,6 @@ def call_openai_compatible(
             request_kwargs["max_completion_tokens"] = max_tokens
         else:
             request_kwargs["max_tokens"] = max_tokens
-
     try:
         resp = client.chat.completions.create(**request_kwargs)
     except BadRequestError as exc:
@@ -418,6 +417,23 @@ def call_openai_compatible(
             raise
 
     return extract_chat_content(resp.choices[0].message.content)
+
+
+def call_openai_responses(
+    client: OpenAI,
+    model_id: str,
+    *,
+    user_prompt: str,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    request_kwargs: dict[str, Any] = {"model": model_id, "input": user_prompt}
+    if max_output_tokens is not None:
+        request_kwargs["max_output_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+    resp = client.responses.create(**request_kwargs)
+    return resp.output_text
 
 
 def build_clients(
@@ -533,12 +549,12 @@ def call_model(
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "openai":
-        return call_openai_compatible(
+        return call_openai_responses(
             clients["openai"],
             spec.model_id,
             user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=generation_max_tokens,
+            max_output_tokens=generation_max_tokens,
+            reasoning_effort=spec.reasoning_effort,
         )
     if spec.provider == "google":
         _timeout = clients.get("_generation_timeout")
@@ -564,11 +580,14 @@ def call_model(
             max_tokens=generation_max_tokens,
         )
     if spec.provider == "anthropic":
-        resp = clients["anthropic"].messages.create(
-            model=spec.model_id,
-            max_tokens=generation_max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        anthropic_kwargs: dict[str, Any] = {
+            "model": spec.model_id,
+            "max_tokens": generation_max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if spec.effort:
+            anthropic_kwargs["extra_body"] = {"output_config": {"effort": spec.effort}}
+        resp = clients["anthropic"].messages.create(**anthropic_kwargs)
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
@@ -771,7 +790,7 @@ def evaluate_item(
 
         started = time.time()
         generation_started = time.time()
-        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
+        effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens) or generation_max_tokens
         try:
             response_text = call_model(
                 model_spec,

@@ -177,6 +177,13 @@ def parse_args() -> argparse.Namespace:
         help="Provider API timeout seconds for generation requests.",
     )
     parser.add_argument(
+        "--generation-max-tokens",
+        type=int,
+        default=None,
+        dest="generation_max_tokens",
+        help="Max tokens for generation (default: 16384).",
+    )
+    parser.add_argument(
         "--use-litellm",
         action="store_true",
         help="Route model calls through a single OpenAI-compatible LiteLLM endpoint.",
@@ -240,6 +247,16 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.max_items = int(section.get("max_items"))
     if args.generation_timeout is None:
         args.generation_timeout = int(section.get("generation_timeout", 120))
+    if args.generation_max_tokens is None:
+        args.generation_max_tokens = int(section.get("generation_max_tokens", 16384))
+    args.model_max_tokens = {
+        k: (int(v) if v is not None else None)
+        for k, v in section.get("model_max_tokens", {}).items()
+    }
+    args.model_generation_timeouts = {
+        k: (int(v) if v is not None else None)
+        for k, v in section.get("model_generation_timeouts", {}).items()
+    }
     if not args.use_litellm:
         args.use_litellm = bool(section.get("use_litellm", False))
 
@@ -256,6 +273,7 @@ def call_openai_compatible(
     system_prompt: str | None = None,
     temperature: float = 0.0,
     max_tokens: int | None = 4096,
+    generation_timeout: int | None = None,
 ) -> str:
     messages: list[dict[str, str]] = []
     if system_prompt:
@@ -273,11 +291,14 @@ def call_openai_compatible(
             request_kwargs["max_completion_tokens"] = max_tokens
         else:
             request_kwargs["max_tokens"] = max_tokens
-
     try:
-        resp = client.chat.completions.create(**request_kwargs)
+        resp = client.chat.completions.create(
+            **request_kwargs,
+            **({"timeout": generation_timeout} if generation_timeout is not None else {}),
+        )
     except BadRequestError as exc:
         message = str(exc).lower()
+        timeout_kw = {"timeout": generation_timeout} if generation_timeout is not None else {}
         if (
             "max_tokens" in request_kwargs
             and "unsupported" in message
@@ -286,7 +307,7 @@ def call_openai_compatible(
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("max_tokens", None)
             retry_kwargs["max_completion_tokens"] = max_tokens
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         elif (
             "max_completion_tokens" in request_kwargs
             and "unsupported" in message
@@ -295,7 +316,7 @@ def call_openai_compatible(
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("max_completion_tokens", None)
             retry_kwargs["max_tokens"] = max_tokens
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         elif (
             "temperature" in request_kwargs
             and "unsupported" in message
@@ -303,11 +324,31 @@ def call_openai_compatible(
         ):
             retry_kwargs = dict(request_kwargs)
             retry_kwargs.pop("temperature", None)
-            resp = client.chat.completions.create(**retry_kwargs)
+            resp = client.chat.completions.create(**retry_kwargs, **timeout_kw)
         else:
             raise
 
     return extract_chat_content(resp.choices[0].message.content)
+
+
+def call_openai_responses(
+    client: OpenAI,
+    model_id: str,
+    *,
+    user_prompt: str,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    generation_timeout: int | None = None,
+) -> str:
+    request_kwargs: dict[str, Any] = {"model": model_id, "input": user_prompt}
+    if max_output_tokens is not None:
+        request_kwargs["max_output_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+    if generation_timeout is not None:
+        request_kwargs["timeout"] = generation_timeout
+    resp = client.responses.create(**request_kwargs)
+    return resp.output_text
 
 
 def build_clients(selected_models: list[str], generation_timeout: int) -> dict[str, Any]:
@@ -376,28 +417,37 @@ def build_clients_with_mode(
     return clients
 
 
-def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_litellm: bool = False) -> str:
+def call_model(
+    model_label: str,
+    clients: dict[str, Any],
+    prompt: str,
+    *,
+    generation_max_tokens: int | None = None,
+    generation_timeout: int | None = None,
+    use_litellm: bool = False,
+) -> str:
     spec = MODEL_LOOKUP[model_label]
-    # 4096 tokens is insufficient for hard coding problems: long solutions get truncated,
-    # and thinking models exhaust the budget before producing any output.
-    # Gemini 2.5 thinking models need extra headroom for internal reasoning chains.
+    max_tokens = generation_max_tokens or 16384
+    # Gemini 2.5/3.1 thinking models need extra headroom for internal reasoning chains.
     _GOOGLE_THINKING_PREFIXES = ("2.5", "3.1")
-    google_max_tokens = 65536 if any(p in spec.model_id for p in _GOOGLE_THINKING_PREFIXES) else 16384
+    google_max_tokens = 65536 if any(p in spec.model_id for p in _GOOGLE_THINKING_PREFIXES) else max_tokens
     if should_use_litellm_for_model(spec, use_litellm=use_litellm):
         return call_openai_compatible(
             clients["litellm"],
             get_routed_model_id(spec, use_litellm=True),
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=16384,
+            max_tokens=max_tokens,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "openai":
-        return call_openai_compatible(
+        return call_openai_responses(
             clients["openai"],
             spec.model_id,
             user_prompt=prompt,
-            temperature=0.0,
-            max_tokens=16384,
+            max_output_tokens=max_tokens,
+            reasoning_effort=spec.reasoning_effort,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "google":
         return call_openai_compatible(
@@ -406,6 +456,7 @@ def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_li
             user_prompt=prompt,
             temperature=0.0,
             max_tokens=google_max_tokens,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "openrouter":
         return call_openai_compatible(
@@ -413,14 +464,20 @@ def call_model(model_label: str, clients: dict[str, Any], prompt: str, *, use_li
             spec.model_id,
             user_prompt=prompt,
             temperature=0.0,
-            max_tokens=16384,
+            max_tokens=max_tokens,
+            generation_timeout=generation_timeout,
         )
     if spec.provider == "anthropic":
-        resp = clients["anthropic"].messages.create(
-            model=spec.model_id,
-            max_tokens=16384,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        anthropic_kwargs: dict[str, Any] = {
+            "model": spec.model_id,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if spec.effort:
+            anthropic_kwargs["extra_body"] = {"output_config": {"effort": spec.effort}}
+        if generation_timeout is not None:
+            anthropic_kwargs["timeout"] = generation_timeout
+        resp = clients["anthropic"].messages.create(**anthropic_kwargs)
         return "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
@@ -1031,6 +1088,10 @@ def evaluate_item(
     selected_model_specs: list[Any],
     clients: dict[str, Any],
     completed_keys: set[str],
+    generation_max_tokens: int | None,
+    generation_timeout: int,
+    model_max_tokens: dict[str, int | None],
+    model_generation_timeouts: dict[str, int | None] | None,
     use_litellm: bool,
 ) -> list[tuple[str, dict[str, Any]]]:
     item = hydrate_sampled_item(item)
@@ -1060,9 +1121,17 @@ def evaluate_item(
             "latency_s": None,
         }
 
+        effective_max_tokens = model_max_tokens.get(model_spec.label, generation_max_tokens) or generation_max_tokens
+        per_model_timeout = (model_generation_timeouts or {}).get(model_spec.label)
+        effective_timeout = per_model_timeout if per_model_timeout is not None else generation_timeout
         started = time.time()
         try:
-            response_text = call_model(model_spec.label, clients, item["prompt"], use_litellm=use_litellm)
+            response_text = call_model(
+                model_spec.label, clients, item["prompt"],
+                generation_max_tokens=effective_max_tokens,
+                generation_timeout=effective_timeout,
+                use_litellm=use_litellm,
+            )
             record["response_text"] = response_text
             record["latency_s"] = round(time.time() - started, 2)
         except Exception as exc:
@@ -1126,6 +1195,9 @@ def main() -> None:
         "datasets": sorted(dataset_counts.keys()),
         "sample_plan": dict(dataset_counts),
         "generation_timeout": args.generation_timeout,
+        "generation_max_tokens": args.generation_max_tokens,
+        "model_max_tokens": args.model_max_tokens,
+        "model_generation_timeouts": args.model_generation_timeouts,
         "use_litellm": args.use_litellm,
         "max_workers": args.max_workers,
         "max_items": args.max_items,
@@ -1180,6 +1252,10 @@ def main() -> None:
                 selected_model_specs=selected_model_specs,
                 clients=clients,
                 completed_keys=completed_keys_snapshot,
+                generation_max_tokens=args.generation_max_tokens,
+                generation_timeout=args.generation_timeout,
+                model_max_tokens=args.model_max_tokens,
+                model_generation_timeouts=args.model_generation_timeouts,
                 use_litellm=args.use_litellm,
             )
             for eval_key, record in item_results:
@@ -1193,6 +1269,10 @@ def main() -> None:
                     selected_model_specs=selected_model_specs,
                     clients=clients,
                     completed_keys=completed_keys_snapshot,
+                    generation_max_tokens=args.generation_max_tokens,
+                    generation_timeout=args.generation_timeout,
+                    model_max_tokens=args.model_max_tokens,
+                    model_generation_timeouts=args.model_generation_timeouts,
                     use_litellm=args.use_litellm,
                 )
                 for item in pending_items
