@@ -243,6 +243,12 @@ def run_mini_swe_agent(
         "--model", routed_model,
         "--output", str(output_dir),
         "--workers", workers,
+        # The caller has already narrowed ``instance_ids`` to the truly-pending
+        # set (based on this eval's responses.jsonl). Disable mini-swe-agent's
+        # own preds.json-based skip so a prior partial/empty preds.json from a
+        # crashed run can't silently no-op the retry. Our responses.jsonl is the
+        # single source of truth for resume.
+        "--redo-existing",
     ]
     extra_args_cfg = agent_cfg.get("extra_args") or {}
     if extra_args_cfg:
@@ -261,8 +267,11 @@ def run_mini_swe_agent(
             continue
         # mini-swe-agent v2 CLI expects custom settings as --config key=value.
         # Passing unknown --flag args causes an argparse exit(2) before any
-        # predictions are produced.
-        cmd.extend(["--config", f"{key_str}={val}"])
+        # predictions are produced. Use JSON for the value so Python ``None``
+        # round-trips as JSON ``null`` (mini-swe-agent runs ``json.loads`` on
+        # the value before falling back to a literal string).
+        val_str = "null" if val is None else str(val)
+        cmd.extend(["--config", f"{key_str}={val_str}"])
 
     if replace_env:
         env = dict(env_overrides or {})
@@ -745,6 +754,33 @@ def evaluate_model(
     subprocess_env = build_model_subprocess_env(base_env, route_env)
     merged_agent_extra_args = dict(agent_cfg.get("extra_args") or {})
     merged_agent_extra_args.update(model_agent_extra_args_overrides.get(label, {}))
+    # mini-swe-agent's bundled swebench.yaml hardcodes
+    # ``model.model_kwargs.temperature: 0.0`` and ``drop_params: true`` does not
+    # save us — both providers below return a hard 400 with that value:
+    #   * OpenAI gpt-5* reasoning models accept only ``temperature=1``.
+    #   * Anthropic claude-opus-4-7* reports ``temperature is deprecated for
+    #     this model`` and requires the parameter to be omitted entirely.
+    #     We send ``None``; LiteLLM filters None temperature out of
+    #     ``non_default_params`` (see litellm/utils.py:_get_non_default_params),
+    #     so the upstream Anthropic call never receives the field.
+    # Mirrors the guard in eval_terminal_bench.py.
+    bare_model_id = routed_model.split("/", 1)[1] if "/" in routed_model else routed_model
+    temp_key = "model.model_kwargs.temperature"
+    _UNSET = object()
+    forced_temp: Any = _UNSET
+    if bare_model_id.startswith("gpt-5"):
+        forced_temp = 1
+    elif bare_model_id.startswith("claude-opus-4-7"):
+        forced_temp = None
+    if forced_temp is not _UNSET:
+        prev = merged_agent_extra_args.get(temp_key, _UNSET)
+        if prev != forced_temp:
+            print(
+                f"[{label}] forcing {temp_key}={forced_temp!r} for {bare_model_id} "
+                f"(was {prev!r}; mini-swe-agent default is 0.0, which this model rejects).",
+                flush=True,
+            )
+            merged_agent_extra_args[temp_key] = forced_temp
     agent_cfg_effective = dict(agent_cfg)
     agent_cfg_effective["extra_args"] = merged_agent_extra_args
     print(

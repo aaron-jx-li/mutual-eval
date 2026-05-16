@@ -6,7 +6,7 @@
 evaluation:
   input_file: data/v1_generic_1000.jsonl
   first_k: 500
-  output_dir: results/arena_eval/generic_v1
+  output_dir: results/arena_eval/generic_v2
   openai_base_url: ${OPENAI_BASE_URL}
   # Keep direct OpenAI calls pointed at OpenAI, not LiteLLM.
   # Example: https://api.openai.com/v1 or https://us.api.openai.com/v1
@@ -38,23 +38,23 @@ evaluation:
   rm_base_url: ${ARENA_RM_BASE_URL}
   rm_token: ${ARENA_RM_TOKEN}
   models:
-    - gpt-5.4
-    - gpt-5-mini
+    # - gpt-5.4
+    # - gpt-5-mini
     - gpt-5.4-mini
     - gpt-5.5
-    - gpt-5.5-high
-    - gpt-4.1
-    - gpt-4.1-mini
-    - claude-opus-4-6
+    # - gpt-5.5-high
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
     - claude-opus-4-7
-    - claude-opus-4-7-thinking
-    - claude-sonnet-4-6
-    - claude-haiku-4-5
-    - gemini-3.1-pro
-    - gemini-2.5-pro
-    - gemini-2.5-flash
-    - grok-4
-    - deepseek-v3.2
-    - mistral-large-3
-    - qwen3-max-thinking
-    - llama-4-maverick-instruct
+    # - claude-opus-4-7-thinking
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
+    # - grok-4
+    # - deepseek-v3.2
+    # - mistral-large-3
+    # - qwen3-max-thinking
+    # - llama-4-maverick-instruct
