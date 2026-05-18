@@ -12,7 +12,7 @@
 #     --models gpt-4.1-mini --max-instances 3
 
 evaluation:
-  output_dir: results/agentic_eval/swe_bench_lite_v1
+  output_dir: results/agentic_eval/swe_bench_lite_v2
 
   # Local clone of https://github.com/princeton-nlp/SWE-bench used by the grader.
   swebench_path: /home/aaronjli/SWE-bench
@@ -49,6 +49,8 @@ evaluation:
   model_agent_extra_args_overrides:
     gpt-5.4:
       reasoning_effort: medium
+    gpt-5.5-high:
+      reasoning_effort: high
 
   grading:
     max_workers: 4
@@ -74,7 +76,7 @@ evaluation:
   #                prefix to pick the right upstream.
   #
   # Static-style primary flag:
-  use_litellm: true
+  use_litellm: false
   #
   # Optional subset selectors (also static-style naming):
   # - If only litellm_models is set, listed models use LiteLLM and all other
@@ -88,18 +90,23 @@ evaluation:
     # - gemini-2.5-pro
     # - gemini-2.5-flash
   native_models:
-    - gpt-5.4
-    - gpt-5-mini
-    - gpt-4.1
-    - gpt-4.1-mini
-    - claude-opus-4-6
-    - claude-sonnet-4-6
-    - claude-haiku-4-5
-    - grok-4
-    - deepseek-v3.2
-    - mistral-large-3
-    - qwen3-max-thinking
-    - llama-4-maverick-instruct
+    # - gpt-5.4
+    # - gpt-5-mini
+    - gpt-5.4-mini
+    - gpt-5.5
+    # - gpt-5.5-high
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    - claude-opus-4-7
+    # - claude-opus-4-7-thinking
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    # - grok-4
+    # - deepseek-v3.2
+    # - mistral-large-3
+    # - qwen3-max-thinking
+    # - llama-4-maverick-instruct
   #
   # Advanced/compat knobs:
   default_route: null       # optional synonym for use_litellm (litellm|native)
@@ -111,20 +118,24 @@ evaluation:
     # Avoid LiteLLM "model not mapped" issues seen with x-ai/grok-4.20-beta.
     grok-4: "openrouter/x-ai/grok-4"
 
-  # The 15-model roster shared with eval_static/config_static_coding.yaml.
   models:
-    - gpt-5.4
-    - gpt-5-mini
-    - gpt-4.1
-    - gpt-4.1-mini
-    - claude-opus-4-6
-    - claude-sonnet-4-6
-    - claude-haiku-4-5
-    - gemini-3.1-pro
-    - gemini-2.5-pro
-    - gemini-2.5-flash
-    - grok-4
-    - deepseek-v3.2
-    - mistral-large-3
-    - qwen3-max-thinking
-    - llama-4-maverick-instruct
+    # - gpt-5.4
+    # - gpt-5-mini
+    - gpt-5.4-mini
+    - gpt-5.5
+    # - gpt-5.5-high
+    # - gpt-4.1
+    # - gpt-4.1-mini
+    # - claude-opus-4-6
+    - claude-opus-4-7
+    # - claude-opus-4-7-thinking
+    # - claude-sonnet-4-6
+    # - claude-haiku-4-5
+    # - gemini-3.1-pro
+    # - gemini-2.5-pro
+    # - gemini-2.5-flash
+    # - grok-4
+    # - deepseek-v3.2
+    # - mistral-large-3
+    # - qwen3-max-thinking
+    # - llama-4-maverick-instruct

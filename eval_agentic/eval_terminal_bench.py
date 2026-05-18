@@ -248,12 +248,18 @@ def build_harbor_cmd(
     return cmd
 
 
-def _parse_trial_result_json(path: Path) -> tuple[float, bool]:
-    """Read Harbor 0.4+ per-trial ``result.json``; return (reward, passed)."""
+def _parse_trial_result_json(path: Path) -> tuple[float, bool, bool]:
+    """Read Harbor 0.4+ per-trial ``result.json``; return (reward, passed, infra_error).
+
+    ``infra_error`` is True when the trial recorded an ``exception_info`` (agent
+    or harness crashed) with no ``verifier_result`` -- i.e. the model never got
+    a real chance to score. Callers should treat such trials as pending so
+    resume retries them rather than counting them as model failures.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return 0.0, False
+        return 0.0, False, False
     vr = data.get("verifier_result")
     if vr and isinstance(vr, dict):
         rewards_map = vr.get("rewards") or {}
@@ -261,15 +267,22 @@ def _parse_trial_result_json(path: Path) -> tuple[float, bool]:
             reward = float(rewards_map.get("reward", 0) or 0)
         except (TypeError, ValueError):
             reward = 0.0
-        return reward, reward >= 1.0
-    # Agent or verifier crashed before scoring (see ``exception_info``).
-    return 0.0, False
+        return reward, reward >= 1.0, False
+    # Agent or verifier crashed before scoring; flag for retry on resume.
+    return 0.0, False, bool(data.get("exception_info"))
 
 
 def _task_trial_finished(job_dir: Path, task_id: str) -> bool:
-    """True once Harbor has written a terminal artifact for this task trial."""
-    if any(job_dir.glob(f"{task_id}__*/result.json")):
-        return True
+    """True once Harbor has written a *scoring* artifact for this task trial.
+
+    Trials whose only artifact is a ``result.json`` carrying an
+    ``exception_info`` (infra/agent crash before scoring) are treated as
+    unfinished so resume retries them.
+    """
+    for rj in job_dir.glob(f"{task_id}__*/result.json"):
+        _, _, infra = _parse_trial_result_json(rj)
+        if not infra:
+            return True
     if any(job_dir.glob(f"{task_id}__*/verifier/reward.txt")):
         return True
     if any(job_dir.glob(f"{task_id}__*/reward.txt")):
@@ -281,7 +294,7 @@ def _quick_pass_for_finished_task(job_dir: Path, task_id: str) -> bool:
     """Best-effort pass/fail for postfix; False if only errors/unparseable."""
     rjs = sorted(job_dir.glob(f"{task_id}__*/result.json"))
     if rjs:
-        _, passed = _parse_trial_result_json(rjs[-1])
+        _, passed, _ = _parse_trial_result_json(rjs[-1])
         return passed
     for pattern in (f"{task_id}__*/verifier/reward.txt", f"{task_id}__*/reward.txt"):
         for rf in sorted(job_dir.glob(pattern)):
@@ -470,22 +483,29 @@ def read_rewards(job_dir: Path, task_ids: list[str]) -> dict[str, dict[str, Any]
         hit = reward_by_task.get(tid)
         if hit is not None:
             rf, reward = hit
-            results[tid] = {"reward": reward, "passed": reward >= 1.0, "reward_path": str(rf)}
+            results[tid] = {
+                "reward": reward,
+                "passed": reward >= 1.0,
+                "reward_path": str(rf),
+                "infra_error": False,
+            }
             continue
         trial_results = sorted(job_dir.glob(f"{tid}__*/result.json"))
         if not trial_results:
-            results[tid] = {"reward": 0.0, "passed": False, "reward_path": None}
+            results[tid] = {"reward": 0.0, "passed": False, "reward_path": None, "infra_error": False}
             continue
         best_path = trial_results[0]
-        best_reward, best_passed = _parse_trial_result_json(best_path)
+        best_reward, best_passed, best_infra = _parse_trial_result_json(best_path)
         for rp in trial_results[1:]:
-            r, p = _parse_trial_result_json(rp)
-            if r > best_reward:
-                best_reward, best_passed, best_path = r, p, rp
+            r, p, infra = _parse_trial_result_json(rp)
+            # Prefer a real verifier result over an infra-error trial, then prefer higher reward.
+            if (best_infra and not infra) or (not infra and r > best_reward):
+                best_reward, best_passed, best_infra, best_path = r, p, infra, rp
         results[tid] = {
             "reward": best_reward,
             "passed": best_passed,
             "reward_path": str(best_path),
+            "infra_error": best_infra,
         }
     return results
 
@@ -575,7 +595,12 @@ def _trial_storage_key(model_label: str, task_id: str, attempt: int) -> str:
 
 
 def load_global_responses(path: Path) -> dict[str, dict[str, Any]]:
-    """Load ``responses.jsonl`` into a dict keyed by ``_trial_storage_key``."""
+    """Load ``responses.jsonl`` into a dict keyed by ``_trial_storage_key``.
+
+    Drops rows whose underlying ``result.json`` recorded an ``exception_info``
+    with no ``verifier_result`` (Harbor/agent crashed before scoring) so resume
+    retries those trials instead of treating an infra flake as a model failure.
+    """
     out: dict[str, dict[str, Any]] = {}
     if not path.exists():
         return out
@@ -593,6 +618,21 @@ def load_global_responses(path: Path) -> dict[str, dict[str, Any]]:
             att = rec.get("attempt")
             if label is None or tid is None or att is None:
                 continue
+            rp = rec.get("reward_path") or ""
+            if not rec.get("passed") and isinstance(rp, str) and rp.endswith("result.json"):
+                rp_path = Path(rp)
+                if rp_path.exists():
+                    try:
+                        data = json.loads(rp_path.read_text(encoding="utf-8"))
+                        if not data.get("verifier_result") and data.get("exception_info"):
+                            print(
+                                f"[load] dropping stale infra-error row "
+                                f"{label}/{tid}#{att}; will retry on --resume.",
+                                flush=True,
+                            )
+                            continue
+                    except (OSError, json.JSONDecodeError):
+                        pass
             out[_trial_storage_key(str(label), str(tid), int(att))] = rec
     return out
 
@@ -801,6 +841,22 @@ def evaluate_model(
     # single model label without affecting the rest of the roster.
     merged_agent_kwargs: dict[str, Any] = dict(agent_cfg.get("kwargs") or {})
     merged_agent_kwargs.update(model_agent_kwargs_overrides.get(label, {}))
+    # OpenAI gpt-5 reasoning models reject any temperature other than 1.
+    # Just dropping the kwarg isn't enough: terminus-2's internal default is 0.7
+    # (see harbor/agents/terminus_2/terminus_2.py: ``temperature: float = 0.7``),
+    # which also gets rejected. Force ``temperature=1`` for gpt-5* so terminus-2
+    # passes the one value the API accepts. Matches eval_static's effective
+    # behavior (it drops temperature; OpenAI's default for these models is 1).
+    bare_model_id = routed_model.split("/", 1)[1] if "/" in routed_model else routed_model
+    if bare_model_id.startswith("gpt-5"):
+        prev = merged_agent_kwargs.get("temperature")
+        if prev != 1:
+            print(
+                f"[{label}] forcing temperature=1 for gpt-5* model "
+                f"(was {prev!r}; OpenAI only accepts 1, terminus-2 default is 0.7).",
+                flush=True,
+            )
+            merged_agent_kwargs["temperature"] = 1
     kwargs_flags: list[str] = []
     for key, val in merged_agent_kwargs.items():
         kwargs_flags.append(f"{key}={val}")
@@ -973,8 +1029,17 @@ def evaluate_model(
             )
 
             rewards = read_rewards(job_dir, pending)
+            infra_failed: list[str] = []
             for tid in pending:
-                r = rewards.get(tid, {"reward": 0.0, "passed": False, "reward_path": None})
+                r = rewards.get(tid, {"reward": 0.0, "passed": False, "reward_path": None, "infra_error": False})
+                if r.get("infra_error"):
+                    infra_failed.append(tid)
+                    # Drop any provisional row written by _checkpoint_finished_task and
+                    # leave the trial unrecorded so the next --resume retries it.
+                    sk = _trial_storage_key(label, tid, attempt)
+                    global_rows.pop(sk, None)
+                    existing.pop(_row_key(tid, attempt), None)
+                    continue
                 row = {
                     "task_id": tid,
                     "attempt": attempt,
@@ -1007,12 +1072,19 @@ def evaluate_model(
                 eval_runs=eval_runs,
                 save_every=save_every,
                 checkpoint_state=checkpoint_state,
-                n_new_rows=sum(1 for tid in pending if tid not in interim_written),
+                n_new_rows=sum(1 for tid in pending if tid not in interim_written and tid not in infra_failed),
                 print_summary=False,
             )
 
             n_pass = sum(1 for t in pending if rewards.get(t, {}).get("passed"))
             print(f"[{label}] attempt={attempt} passed {n_pass}/{len(pending)} newly graded.", flush=True)
+            if infra_failed:
+                print(
+                    f"[{label}] attempt={attempt}: {len(infra_failed)} trial(s) hit a Harbor/agent "
+                    f"exception before scoring; not recording so --resume retries: "
+                    f"{', '.join(infra_failed)}",
+                    flush=True,
+                )
 
     # Return rows in a deterministic order (task first, then attempt).
     return [existing[_row_key(t, a)] for t in task_ids for a in range(eval_runs) if _row_key(t, a) in existing]

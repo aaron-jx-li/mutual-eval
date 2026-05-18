@@ -429,6 +429,10 @@ def apply_config_defaults(args: argparse.Namespace) -> argparse.Namespace:
         key: (int(value) if value is not None else None)
         for key, value in section.get("model_max_tokens", {}).items()
     }
+    args.model_generation_timeouts = {
+        key: (int(value) if value is not None else None)
+        for key, value in section.get("model_generation_timeouts", {}).items()
+    }
     if args.output_dir is None:
         args.output_dir = section.get("output_dir")
     if args.save_every == 50:
@@ -455,8 +459,10 @@ def evaluate_item(
     judge_model: str,
     completed_keys: set[str],
     generation_max_tokens: int | None,
+    generation_timeout: int,
     generation_retries: int,
     model_max_tokens: dict[str, int | None] | None,
+    model_generation_timeouts: dict[str, int | None] | None,
     use_litellm: bool,
     litellm_models: set[str] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -491,6 +497,8 @@ def evaluate_item(
 
         started = time.time()
         effective_max_tokens = (model_max_tokens or {}).get(model_spec.label, generation_max_tokens)
+        per_model_timeout = (model_generation_timeouts or {}).get(model_spec.label)
+        effective_timeout = per_model_timeout if per_model_timeout is not None else generation_timeout
         response_text: str | None = None
         last_generation_error: str | None = None
         for attempt in range(generation_retries + 1):
@@ -501,6 +509,7 @@ def evaluate_item(
                     clients,
                     item["prompt"],
                     generation_max_tokens=effective_max_tokens,
+                    generation_timeout=effective_timeout,
                     use_litellm=use_litellm,
                     litellm_models=litellm_models,
                 )
@@ -618,6 +627,7 @@ def main() -> None:
         "generation_max_tokens": args.generation_max_tokens,
         "generation_retries": args.generation_retries,
         "model_max_tokens": args.model_max_tokens,
+        "model_generation_timeouts": args.model_generation_timeouts,
         "use_litellm": args.use_litellm,
         "litellm_models": sorted(litellm_models) if litellm_models is not None else None,
         "max_workers": args.max_workers,
@@ -677,8 +687,10 @@ def main() -> None:
                 judge_model=args.judge_model,
                 completed_keys=completed_keys_snapshot,
                 generation_max_tokens=args.generation_max_tokens,
+                generation_timeout=args.generation_timeout,
                 generation_retries=args.generation_retries,
                 model_max_tokens=args.model_max_tokens,
+                model_generation_timeouts=args.model_generation_timeouts,
                 use_litellm=args.use_litellm,
                 litellm_models=litellm_models,
             )
@@ -695,8 +707,10 @@ def main() -> None:
                     judge_model=args.judge_model,
                     completed_keys=completed_keys_snapshot,
                     generation_max_tokens=args.generation_max_tokens,
+                    generation_timeout=args.generation_timeout,
                     generation_retries=args.generation_retries,
                     model_max_tokens=args.model_max_tokens,
+                    model_generation_timeouts=args.model_generation_timeouts,
                     use_litellm=args.use_litellm,
                     litellm_models=litellm_models,
                 )
